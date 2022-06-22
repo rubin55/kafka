@@ -29,7 +29,9 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.channels.SeekableByteChannel;
 import java.nio.file.Files;
+import java.nio.file.OpenOption;
 import java.nio.file.StandardOpenOption;
 import java.util.Objects;
 import java.util.Optional;
@@ -462,9 +464,14 @@ public class FileRecords extends AbstractRecords implements Closeable {
                                            boolean preallocate) throws IOException {
         if (mutable) {
             if (preallocate && !fileAlreadyExists) {
-                try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw")) {
-                    randomAccessFile.setLength(initFileSize);
-                }
+				final OpenOption[] options = { StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE };
+				try (final SeekableByteChannel channel = Files.newByteChannel(file.toPath(), options)) {
+					channel.position(initFileSize-Integer.BYTES);
+
+					final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
+					buffer.rewind();
+					channel.write(buffer);
+				}
             }
             /* A separate open call is needed even when having a RandomAccessFile
                to ensure that under Windows FILE_SHARE_DELETE is enabled for the open file. */
