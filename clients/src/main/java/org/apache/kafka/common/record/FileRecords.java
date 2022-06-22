@@ -461,14 +461,15 @@ public class FileRecords extends AbstractRecords implements Closeable {
                                            int initFileSize,
                                            boolean preallocate) throws IOException {
         if (mutable) {
-            if (fileAlreadyExists || !preallocate) {
-                return FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ,
-                        StandardOpenOption.WRITE);
-            } else {
-                RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw");
-                randomAccessFile.setLength(initFileSize);
-                return randomAccessFile.getChannel();
+            if (preallocate && !fileAlreadyExists) {
+                try (RandomAccessFile randomAccessFile = new RandomAccessFile(file, "rw")) {
+                    randomAccessFile.setLength(initFileSize);
+                }
             }
+            /* A separate open call is needed even when having a RandomAccessFile
+               to ensure that under Windows FILE_SHARE_DELETE is enabled for the open file. */
+           return FileChannel.open(file.toPath(), StandardOpenOption.CREATE,
+                    StandardOpenOption.READ, StandardOpenOption.WRITE);
         } else {
             return FileChannel.open(file.toPath());
         }
