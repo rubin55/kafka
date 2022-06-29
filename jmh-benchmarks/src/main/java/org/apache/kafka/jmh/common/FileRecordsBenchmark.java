@@ -19,6 +19,7 @@ package org.apache.kafka.jmh.cache;
 
 import java.util.concurrent.TimeUnit;
 import org.apache.kafka.common.cache.LRUCache;
+import org.apache.kafka.common.utils.Utils;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.OutputTimeUnit;
@@ -106,19 +107,11 @@ public class FileRecordsBenchmark {
                                            boolean preallocate) throws IOException {
         if (mutable) {
             if (preallocate && !fileAlreadyExists) {
-				final OpenOption[] options = { StandardOpenOption.WRITE, StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE };
-				try (final SeekableByteChannel channel = Files.newByteChannel(file.toPath(), options)) {
-					channel.position(initFileSize-Integer.BYTES);
-
-					final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
-					buffer.rewind();
-					channel.write(buffer);
-				}
+                return Utils.createPreallocatedFile(file.toPath(), initFileSize);
+            } else {
+                return FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ,
+                        StandardOpenOption.WRITE);
             }
-            /* A separate open call is needed even when having a RandomAccessFile
-               to ensure that under Windows FILE_SHARE_DELETE is enabled for the open file. */
-           return FileChannel.open(file.toPath(), StandardOpenOption.CREATE,
-                    StandardOpenOption.READ, StandardOpenOption.WRITE);
         } else {
             return FileChannel.open(file.toPath());
         }

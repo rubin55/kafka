@@ -19,11 +19,9 @@ package kafka.log
 
 import java.io.{Closeable, File, RandomAccessFile}
 import java.nio.channels.FileChannel
-import java.nio.file.Files
-import java.nio.file.StandardOpenOption
+import java.nio.file.{Files, StandardOpenOption}
 import java.nio.{ByteBuffer, MappedByteBuffer}
 import java.util.concurrent.locks.{Lock, ReentrantLock}
-
 import kafka.common.IndexOffsetOverflowException
 import kafka.utils.CoreUtils.inLock
 import kafka.utils.{CoreUtils, Logging}
@@ -109,43 +107,42 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
   @volatile
   protected var mmap: MappedByteBuffer = {
     val newlyCreated = file.createNewFile()
-    /* pre-allocate the file if necessary */
-    if(newlyCreated) {
-      if(maxIndexSize < entrySize)
-        throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
-      val raf = if (writable) new RandomAccessFile(file, "rw") else new RandomAccessFile(file, "r")
-      try {
-        raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize))
-        /* we do not use raf.getChannel() below, as it returns an improperly locked handle
-           under Windows - e.g. missing FILE_SHARE_DELETE flag */
-      } finally {
-        CoreUtils.swallow(raf.close(), AbstractIndex)
-      }
-    }
-    /* memory-map the file */
-    val fc : FileChannel = {
-      if(writable)
-        FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
-      else
-        FileChannel.open(file.toPath())
-    }
+
+    val options = if (writable) List(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.SPARSE) else List(StandardOpenOption.READ, StandardOpenOption.SPARSE)
+    val channel = FileChannel.open(file.toPath(), options: _*)
+
     try {
-      _length = fc.size()
+      /* pre-allocate the file if necessary */
+      if(newlyCreated) {
+        if(maxIndexSize < entrySize)
+          throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
+
+        val size = roundDownToExactMultiple(maxIndexSize, entrySize) - Integer.BYTES
+        channel.position(size);
+
+        val buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0)
+        buffer.rewind()
+        channel.write(buffer)
+        channel.position(0)
+      }
+
+      /* memory-map the file */
+      _length = channel.size()
       val idx = {
-        if(writable)
-          fc.map(FileChannel.MapMode.READ_WRITE, 0, _length)
+        if (writable)
+          channel.map(FileChannel.MapMode.READ_WRITE, 0, _length)
         else
-          fc.map(FileChannel.MapMode.READ_ONLY, 0, _length)
+          channel.map(FileChannel.MapMode.READ_ONLY, 0, _length)
       }
       /* set the position in the index for the next entry */
       if(newlyCreated)
         idx.position(0)
       else
-        // if this is a pre-existing index, assume it is valid and set position to last entry
+      // if this is a pre-existing index, assume it is valid and set position to last entry
         idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
       idx
     } finally {
-      CoreUtils.swallow(fc.close(), AbstractIndex)
+      CoreUtils.swallow(channel.close(), AbstractIndex)
     }
   }
 
