@@ -1426,20 +1426,33 @@ public final class Utils {
     }
 
     /**
-     * Creates a preallocated file
+     * Creates a preallocated file.
+     * It is a caller's responsibility to free up the returned resource i.e. close the FileChannel
      * @param path File path
      * @param size The size used for pre allocate file, for example 512 * 1025 *1024
+     * @throws IOException
      */
     public static FileChannel createPreallocatedFile(Path path, int size) throws IOException {
         final OpenOption[] options = { StandardOpenOption.READ, StandardOpenOption.WRITE,
                 StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE };
         final FileChannel channel = FileChannel.open(path, options);
+
+        preallocateFile(channel, size);
+
+        return channel;
+    }
+
+    /**
+     * Preallocates an existing file
+     * @param channel FileChannel to preallocate
+     * @param size The size used for pre allocate file, for example 512 * 1025 *1024
+     * @throws IOException
+     */
+    public static void preallocateFile(FileChannel channel, int size) throws IOException {
         channel.position(size-Integer.BYTES);
         final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
         buffer.rewind();
         channel.write(buffer);
         channel.position(0);
-
-        return channel;
     }
 }

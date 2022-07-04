@@ -117,13 +117,8 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
         if(maxIndexSize < entrySize)
           throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
 
-        val size = roundDownToExactMultiple(maxIndexSize, entrySize) - Integer.BYTES
-        channel.position(size);
-
-        val buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0)
-        buffer.rewind()
-        channel.write(buffer)
-        channel.position(0)
+        val size = roundDownToExactMultiple(maxIndexSize, entrySize)
+        Utils.preallocateFile(channel, size)
       }
 
       /* memory-map the file */
