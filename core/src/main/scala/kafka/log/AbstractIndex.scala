@@ -17,7 +17,7 @@
 
 package kafka.log
 
-import java.io.{Closeable, File, RandomAccessFile}
+import java.io.{Closeable, File}
 import java.nio.channels.FileChannel
 import java.nio.file.{Files, StandardOpenOption}
 import java.nio.{ByteBuffer, MappedByteBuffer}
@@ -183,29 +183,24 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
         debug(s"Index ${file.getAbsolutePath} was not resized because it already has size $roundedNewSize")
         false
       } else {
-        val position = mmap.position()
-        /* Windows or z/OS won't let us modify the file length while the file is mmapped :-( */
-        if (OperatingSystem.IS_WINDOWS || OperatingSystem.IS_ZOS)
-          safeForceUnmap()
-        val raf = new RandomAccessFile(file, "rw")
+        val channel = FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
         try {
-          raf.setLength(roundedNewSize)
+          val position = mmap.position()
+
+          /* Windows or z/OS won't let us modify the file length while the file is mmapped :-( */
+          if (OperatingSystem.IS_WINDOWS || OperatingSystem.IS_ZOS)
+            safeForceUnmap()
+          Utils.preallocateFile(channel, roundedNewSize)
+          _length = roundedNewSize
+          mmap = channel.map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
+          _maxEntries = mmap.limit() / entrySize
+          mmap.position(position)
+          debug(s"Resized ${file.getAbsolutePath} to $roundedNewSize, position is ${mmap.position()} " +
+            s"and limit is ${mmap.limit()}")
+          true
         } finally {
-          CoreUtils.swallow(raf.close(), AbstractIndex)
+          CoreUtils.swallow(channel.close(), AbstractIndex)
         }
-        _length = roundedNewSize
-        /* need to open the file through FileChannel API, to get FILE_SHARE_DELETE on Windows */
-        val fc = FileChannel.open(file.toPath(), StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE)
-        try {
-          mmap = fc.map(FileChannel.MapMode.READ_WRITE, 0, roundedNewSize)
-        } finally {
-          CoreUtils.swallow(fc.close(), AbstractIndex)
-        }
-        _maxEntries = mmap.limit() / entrySize
-        mmap.position(position)
-        debug(s"Resized ${file.getAbsolutePath} to $roundedNewSize, position is ${mmap.position()} " +
-          s"and limit is ${mmap.limit()}")
-        true
       }
     }
   }

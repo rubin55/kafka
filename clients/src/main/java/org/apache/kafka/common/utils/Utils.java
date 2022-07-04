@@ -1449,10 +1449,15 @@ public final class Utils {
      * @throws IOException
      */
     public static void preallocateFile(FileChannel channel, int size) throws IOException {
-        channel.position(size-Integer.BYTES);
-        final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
-        buffer.rewind();
-        channel.write(buffer);
-        channel.position(0);
+        if (size < channel.size()) {
+            channel.truncate(size);
+        }
+        else if (size > channel.size()) {
+            channel.position(size - Integer.BYTES);
+            final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
+            buffer.rewind();
+            channel.write(buffer);
+            channel.position(0);
+        }
     }
 }
