@@ -108,7 +108,7 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
   protected var mmap: MappedByteBuffer = {
     val newlyCreated = file.createNewFile()
 
-    val options = if (writable) List(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.SPARSE) else List(StandardOpenOption.READ, StandardOpenOption.SPARSE)
+    val options = if (writable) List(StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.SPARSE) else List(StandardOpenOption.READ)
     val channel = FileChannel.open(file.toPath(), options: _*)
 
     try {
