@@ -17,7 +17,6 @@
 package org.apache.kafka.common.utils;
 
 import java.nio.BufferUnderflowException;
-import java.nio.file.*;
 import java.util.AbstractMap;
 import java.util.EnumSet;
 import java.util.Map.Entry;
@@ -42,6 +41,15 @@ import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
+import java.nio.file.Files;
+import java.nio.file.NoSuchFileException;
+import java.nio.file.OpenOption;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.text.DecimalFormat;
 import java.text.DecimalFormatSymbols;
@@ -1433,8 +1441,8 @@ public final class Utils {
      * @throws IOException
      */
     public static FileChannel createPreallocatedFile(Path path, int size) throws IOException {
-        final OpenOption[] options = { StandardOpenOption.READ, StandardOpenOption.WRITE,
-                StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE };
+        final OpenOption[] options = {StandardOpenOption.READ, StandardOpenOption.WRITE,
+            StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE};
         final FileChannel channel = FileChannel.open(path, options);
 
         preallocateFile(channel, size);
@@ -1451,8 +1459,7 @@ public final class Utils {
     public static void preallocateFile(FileChannel channel, int size) throws IOException {
         if (size < channel.size()) {
             channel.truncate(size);
-        }
-        else if (size > channel.size()) {
+        } else if (size > channel.size()) {
             channel.position(size - Integer.BYTES);
             final ByteBuffer buffer = ByteBuffer.allocate(Integer.BYTES).putInt(0);
             buffer.rewind();
