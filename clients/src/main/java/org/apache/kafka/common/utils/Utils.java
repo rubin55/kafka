@@ -1442,7 +1442,7 @@ public final class Utils {
      */
     public static FileChannel createPreallocatedFile(Path path, int size) throws IOException {
         final OpenOption[] options = {StandardOpenOption.READ, StandardOpenOption.WRITE,
-            StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE};
+            StandardOpenOption.CREATE, StandardOpenOption.SPARSE};
         final FileChannel channel = FileChannel.open(path, options);
 
         preallocateFile(channel, size);
