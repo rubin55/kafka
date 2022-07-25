@@ -75,7 +75,7 @@ public class CheckpointFile<T> {
     public void write(Collection<T> entries) throws IOException {
         synchronized (lock) {
             final OpenOption[] options = {StandardOpenOption.WRITE,
-                StandardOpenOption.CREATE_NEW, StandardOpenOption.SPARSE};
+                StandardOpenOption.CREATE, StandardOpenOption.SPARSE};
 
             // write to temp file and then swap with the existing file
             try (BufferedWriter writer = Files.newBufferedWriter(tempPath, StandardCharsets.UTF_8, options)) {
