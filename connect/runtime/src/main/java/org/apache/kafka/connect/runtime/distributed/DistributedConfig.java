@@ -28,14 +28,18 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.crypto.KeyGenerator;
-import javax.crypto.Mac;
 import java.security.InvalidParameterException;
 import java.security.NoSuchAlgorithmException;
+import java.security.Provider;
+import java.security.Security;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 import static org.apache.kafka.common.config.ConfigDef.Range.atLeast;
@@ -114,7 +118,7 @@ public class DistributedConfig extends WorkerConfig {
      * <code>offset.storage.topic</code>
      */
     public static final String OFFSET_STORAGE_TOPIC_CONFIG = OFFSET_STORAGE_PREFIX + TOPIC_SUFFIX;
-    private static final String OFFSET_STORAGE_TOPIC_CONFIG_DOC = "The name of the Kafka topic where connector offsets are stored";
+    private static final String OFFSET_STORAGE_TOPIC_CONFIG_DOC = "The name of the Kafka topic where source connector offsets are stored";
 
     /**
      * <code>offset.storage.partitions</code>
@@ -176,8 +180,10 @@ public class DistributedConfig extends WorkerConfig {
     public static final int SCHEDULED_REBALANCE_MAX_DELAY_MS_DEFAULT = Math.toIntExact(TimeUnit.SECONDS.toMillis(300));
 
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG = "inter.worker.key.generation.algorithm";
-    public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys";
     public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT = "HmacSHA256";
+    public static final String INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC = "The algorithm to use for generating internal request keys. "
+            + "The algorithm '" + INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT + "' will be used as a default on JVMs that support it; "
+            + "on other JVMs, no default is used and a value for this property must be manually specified in the worker config.";
 
     public static final String INTER_WORKER_KEY_SIZE_CONFIG = "inter.worker.key.size";
     public static final String INTER_WORKER_KEY_SIZE_DOC = "The size of the key to use for signing internal requests, in bits. "
@@ -190,12 +196,18 @@ public class DistributedConfig extends WorkerConfig {
     public static final int INTER_WORKER_KEY_TTL_MS_MS_DEFAULT = Math.toIntExact(TimeUnit.HOURS.toMillis(1));
 
     public static final String INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG = "inter.worker.signature.algorithm";
-    public static final String INTER_WORKER_SIGNATURE_ALGORITHM_DOC = "The algorithm used to sign internal requests";
     public static final String INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT = "HmacSHA256";
+    public static final String INTER_WORKER_SIGNATURE_ALGORITHM_DOC = "The algorithm used to sign internal requests"
+            + "The algorithm '" + INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG + "' will be used as a default on JVMs that support it; "
+            + "on other JVMs, no default is used and a value for this property must be manually specified in the worker config.";
 
     public static final String INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG = "inter.worker.verification.algorithms";
-    public static final String INTER_WORKER_VERIFICATION_ALGORITHMS_DOC = "A list of permitted algorithms for verifying internal requests";
     public static final List<String> INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT = Collections.singletonList(INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT);
+    public static final String INTER_WORKER_VERIFICATION_ALGORITHMS_DOC = "A list of permitted algorithms for verifying internal requests, "
+        + "which must include the algorithm used for the " + INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG + " property. "
+        + "The algorithm(s) '" + INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT + "' will be used as a default on JVMs that provide them; "
+        + "on other JVMs, no default is used and a value for this property must be manually specified in the worker config.";
+    private Crypto crypto;
 
     private enum ExactlyOnceSourceSupport {
         DISABLED(false),
@@ -220,13 +232,69 @@ public class DistributedConfig extends WorkerConfig {
 
     public static final String EXACTLY_ONCE_SOURCE_SUPPORT_CONFIG = "exactly.once.source.support";
     public static final String EXACTLY_ONCE_SOURCE_SUPPORT_DOC = "Whether to enable exactly-once support for source connectors in the cluster "
-            + "by using transactions to write source records and their source offsets, and by proactively fencing out old task generations before bringing up new ones. ";
-            // TODO: https://issues.apache.org/jira/browse/KAFKA-13709
-            //       + "See the exactly-once source support documentation at [add docs link here] for more information on this feature.";
+            + "by using transactions to write source records and their source offsets, and by proactively fencing out old task generations before bringing up new ones.\n"
+            + "To enable exactly-once source support on a new cluster, set this property to '" + ExactlyOnceSourceSupport.ENABLED + "'. "
+            + "To enable support on an existing cluster, first set to '" + ExactlyOnceSourceSupport.PREPARING + "' on every worker in the cluster, "
+            + "then set to '" + ExactlyOnceSourceSupport.ENABLED + "'. A rolling upgrade may be used for both changes. "
+            + "For more information on this feature, see the "
+            + "<a href=\"https://kafka.apache.org/documentation.html#connect_exactlyoncesource\">exactly-once source support documentation</a>.";
     public static final String EXACTLY_ONCE_SOURCE_SUPPORT_DEFAULT = ExactlyOnceSourceSupport.DISABLED.toString();
 
+    private static Object defaultKeyGenerationAlgorithm(Crypto crypto) {
+        try {
+            validateKeyAlgorithm(crypto, INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG, INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT);
+            return INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT;
+        } catch (Throwable t) {
+            log.info(
+                    "The default key generation algorithm '{}' does not appear to be available on this worker."
+                            + "A key algorithm will have to be manually specified via the '{}' worker property",
+                    INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT,
+                    INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG
+            );
+            return ConfigDef.NO_DEFAULT_VALUE;
+        }
+    }
+
+    private static Object defaultSignatureAlgorithm(Crypto crypto) {
+        try {
+            validateSignatureAlgorithm(crypto, INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG, INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT);
+            return INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT;
+        } catch (Throwable t) {
+            log.info(
+                    "The default signature algorithm '{}' does not appear to be available on this worker."
+                            + "A signature algorithm will have to be manually specified via the '{}' worker property",
+                    INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT,
+                    INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG
+            );
+            return ConfigDef.NO_DEFAULT_VALUE;
+        }
+    }
+
+    private static Object defaultVerificationAlgorithms(Crypto crypto) {
+        List<String> result = new ArrayList<>();
+        for (String verificationAlgorithm : INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT) {
+            try {
+                validateSignatureAlgorithm(crypto, INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG, verificationAlgorithm);
+                result.add(verificationAlgorithm);
+            } catch (Throwable t) {
+                log.trace("Verification algorithm '{}' not found", verificationAlgorithm);
+            }
+        }
+        if (result.isEmpty()) {
+            log.info(
+                    "The default verification algorithm '{}' does not appear to be available on this worker."
+                            + "One or more verification algorithms will have to be manually specified via the '{}' worker property",
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT,
+                    INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG
+            );
+            return ConfigDef.NO_DEFAULT_VALUE;
+        }
+        return result;
+    }
+
     @SuppressWarnings("unchecked")
-    private static final ConfigDef CONFIG = baseConfigDef()
+    private static ConfigDef config(Crypto crypto) {
+        return baseConfigDef()
             .define(GROUP_ID_CONFIG,
                     ConfigDef.Type.STRING,
                     ConfigDef.Importance.HIGH,
@@ -311,7 +379,7 @@ public class DistributedConfig extends WorkerConfig {
                     atLeast(0),
                     ConfigDef.Importance.MEDIUM,
                     CommonClientConfigs.REQUEST_TIMEOUT_MS_DOC)
-                    /* default is set to be a bit lower than the server default (10 min), to avoid both client and server closing connection at same time */
+            /* default is set to be a bit lower than the server default (10 min), to avoid both client and server closing connection at same time */
             .define(CommonClientConfigs.CONNECTIONS_MAX_IDLE_MS_CONFIG,
                     ConfigDef.Type.LONG,
                     TimeUnit.MINUTES.toMillis(9),
@@ -406,11 +474,10 @@ public class DistributedConfig extends WorkerConfig {
                     INTER_WORKER_KEY_TTL_MS_MS_DOC)
             .define(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG,
                     ConfigDef.Type.STRING,
-                    INTER_WORKER_KEY_GENERATION_ALGORITHM_DEFAULT,
+                    defaultKeyGenerationAlgorithm(crypto),
                     ConfigDef.LambdaValidator.with(
-                        (name, value) -> validateKeyAlgorithm(name, (String) value),
-                        () -> "Any KeyGenerator algorithm supported by the worker JVM"
-                    ),
+                            (name, value) -> validateKeyAlgorithm(crypto, name, (String) value),
+                            () -> "Any KeyGenerator algorithm supported by the worker JVM"),
                     ConfigDef.Importance.LOW,
                     INTER_WORKER_KEY_GENERATION_ALGORITHM_DOC)
             .define(INTER_WORKER_KEY_SIZE_CONFIG,
@@ -420,21 +487,21 @@ public class DistributedConfig extends WorkerConfig {
                     INTER_WORKER_KEY_SIZE_DOC)
             .define(INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG,
                     ConfigDef.Type.STRING,
-                    INTER_WORKER_SIGNATURE_ALGORITHM_DEFAULT,
+                    defaultSignatureAlgorithm(crypto),
                     ConfigDef.LambdaValidator.with(
-                        (name, value) -> validateSignatureAlgorithm(name, (String) value),
-                        () -> "Any MAC algorithm supported by the worker JVM"),
+                            (name, value) -> validateSignatureAlgorithm(crypto, name, (String) value),
+                            () -> "Any MAC algorithm supported by the worker JVM"),
                     ConfigDef.Importance.LOW,
                     INTER_WORKER_SIGNATURE_ALGORITHM_DOC)
             .define(INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG,
                     ConfigDef.Type.LIST,
-                    INTER_WORKER_VERIFICATION_ALGORITHMS_DEFAULT,
+                    defaultVerificationAlgorithms(crypto),
                     ConfigDef.LambdaValidator.with(
-                        (name, value) -> validateSignatureAlgorithms(name, (List<String>) value),
-                        () -> "A list of one or more MAC algorithms, each supported by the worker JVM"
-                    ),
+                            (name, value) -> validateVerificationAlgorithms(crypto, name, (List<String>) value),
+                            () -> "A list of one or more MAC algorithms, each supported by the worker JVM"),
                     ConfigDef.Importance.LOW,
                     INTER_WORKER_VERIFICATION_ALGORITHMS_DOC);
+    }
 
     private final ExactlyOnceSourceSupport exactlyOnceSourceSupport;
 
@@ -485,19 +552,24 @@ public class DistributedConfig extends WorkerConfig {
     }
 
     public DistributedConfig(Map<String, String> props) {
-        super(CONFIG, props);
+        this(Crypto.SYSTEM, props);
+    }
+
+    // Visible for testing
+    DistributedConfig(Crypto crypto, Map<String, String> props) {
+        super(config(crypto), props);
+        this.crypto = crypto;
         exactlyOnceSourceSupport = ExactlyOnceSourceSupport.fromProperty(getString(EXACTLY_ONCE_SOURCE_SUPPORT_CONFIG));
-        getInternalRequestKeyGenerator(); // Check here for a valid key size + key algorithm to fail fast if either are invalid
-        validateKeyAlgorithmAndVerificationAlgorithms();
+        validateInterWorkerKeyConfigs();
     }
 
     public static void main(String[] args) {
-        System.out.println(CONFIG.toHtml(4, config -> "connectconfigs_" + config));
+        System.out.println(config(Crypto.SYSTEM).toHtml(4, config -> "connectconfigs_" + config));
     }
 
     public KeyGenerator getInternalRequestKeyGenerator() {
         try {
-            KeyGenerator result = KeyGenerator.getInstance(getString(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG));
+            KeyGenerator result = crypto.keyGenerator(getString(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG));
             Optional.ofNullable(getInt(INTER_WORKER_KEY_SIZE_CONFIG)).ifPresent(result::init);
             return result;
         } catch (NoSuchAlgorithmException | InvalidParameterException e) {
@@ -537,42 +609,75 @@ public class DistributedConfig extends WorkerConfig {
         return topicSettings(STATUS_STORAGE_PREFIX);
     }
 
-    private void validateKeyAlgorithmAndVerificationAlgorithms() {
-        String keyAlgorithm = getString(INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG);
+    private void validateInterWorkerKeyConfigs() {
+        getInternalRequestKeyGenerator();
+        ensureVerificationAlgorithmsIncludeSignatureAlgorithm();
+    }
+
+    private void ensureVerificationAlgorithmsIncludeSignatureAlgorithm() {
+        String signatureAlgorithm = getString(INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG);
         List<String> verificationAlgorithms = getList(INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG);
-        if (!verificationAlgorithms.contains(keyAlgorithm)) {
+        if (!verificationAlgorithms.contains(signatureAlgorithm)) {
             throw new ConfigException(
-                INTER_WORKER_KEY_GENERATION_ALGORITHM_CONFIG,
-                keyAlgorithm,
-                String.format("Key generation algorithm must be present in %s list", INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG)
+                INTER_WORKER_SIGNATURE_ALGORITHM_CONFIG,
+                signatureAlgorithm,
+                String.format("Signature algorithm must be present in %s list", INTER_WORKER_VERIFICATION_ALGORITHMS_CONFIG)
             );
         }
     }
 
-    private static void validateSignatureAlgorithms(String configName, List<String> algorithms) {
+    private static void validateVerificationAlgorithms(Crypto crypto, String configName, List<String> algorithms) {
         if (algorithms.isEmpty()) {
             throw new ConfigException(
-                configName,
-                algorithms,
-                "At least one signature verification algorithm must be provided"
+                    configName,
+                    algorithms,
+                    "At least one signature verification algorithm must be provided"
             );
         }
-        algorithms.forEach(algorithm -> validateSignatureAlgorithm(configName, algorithm));
-    }
-
-    private static void validateSignatureAlgorithm(String configName, String algorithm) {
-        try {
-            Mac.getInstance(algorithm);
-        } catch (NoSuchAlgorithmException e) {
-            throw new ConfigException(configName, algorithm, e.getMessage());
+        for (String algorithm : algorithms) {
+            try {
+                crypto.mac(algorithm);
+            } catch (NoSuchAlgorithmException e) {
+                throw unsupportedAlgorithmException(configName, algorithm, "Mac");
+            }
         }
     }
 
-    private static void validateKeyAlgorithm(String configName, String algorithm) {
+    private static void validateSignatureAlgorithm(Crypto crypto, String configName, String algorithm) {
         try {
-            KeyGenerator.getInstance(algorithm);
+            crypto.mac(algorithm);
         } catch (NoSuchAlgorithmException e) {
-            throw new ConfigException(configName, algorithm, e.getMessage());
+            throw unsupportedAlgorithmException(configName, algorithm, "Mac");
         }
     }
+
+    private static void validateKeyAlgorithm(Crypto crypto, String configName, String algorithm) {
+        try {
+            crypto.keyGenerator(algorithm);
+        } catch (NoSuchAlgorithmException e) {
+            throw unsupportedAlgorithmException(configName, algorithm, "KeyGenerator");
+        }
+    }
+
+    private static ConfigException unsupportedAlgorithmException(String name, Object value, String type) {
+        return new ConfigException(
+                name,
+                value,
+                "the algorithm is not supported by this JVM; the supported algorithms are: " + supportedAlgorithms(type)
+        );
+    }
+
+    // Visible for testing
+    static Set<String> supportedAlgorithms(String type) {
+        Set<String> result = new HashSet<>();
+        for (Provider provider : Security.getProviders()) {
+            for (Provider.Service service : provider.getServices()) {
+                if (type.equals(service.getType())) {
+                    result.add(service.getAlgorithm());
+                }
+            }
+        }
+        return result;
+    }
+
 }

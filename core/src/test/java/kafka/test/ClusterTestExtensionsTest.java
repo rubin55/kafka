@@ -90,6 +90,10 @@ public class ClusterTestExtensionsTest {
         @ClusterTest(name = "cluster-tests-2", clusterType = Type.KRAFT, serverProperties = {
             @ClusterConfigProperty(key = "foo", value = "baz"),
             @ClusterConfigProperty(key = "spam", value = "eggz")
+        }),
+        @ClusterTest(name = "cluster-tests-3", clusterType = Type.CO_KRAFT, serverProperties = {
+            @ClusterConfigProperty(key = "foo", value = "baz"),
+            @ClusterConfigProperty(key = "spam", value = "eggz")
         })
     })
     public void testClusterTests() {
@@ -113,6 +117,6 @@ public class ClusterTestExtensionsTest {
 
     @ClusterTest
     public void testDefaults(ClusterConfig config) {
-        Assertions.assertEquals(MetadataVersion.IBP_3_3_IV3, config.metadataVersion());
+        Assertions.assertEquals(MetadataVersion.IBP_3_4_IV1, config.metadataVersion());
     }
 }

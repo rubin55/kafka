@@ -29,6 +29,7 @@ import org.apache.kafka.connect.runtime.ConnectorConfig;
 import org.apache.kafka.connect.runtime.Herder;
 import org.apache.kafka.connect.runtime.RestartRequest;
 import org.apache.kafka.connect.runtime.WorkerConfig;
+import org.apache.kafka.connect.runtime.distributed.Crypto;
 import org.apache.kafka.connect.runtime.distributed.RebalanceNeededException;
 import org.apache.kafka.connect.runtime.distributed.RequestTargetException;
 import org.apache.kafka.connect.runtime.rest.InternalRequestSignature;
@@ -76,41 +77,33 @@ import static org.apache.kafka.connect.runtime.WorkerConfig.TOPIC_TRACKING_ENABL
 @Path("/connectors")
 @Produces(MediaType.APPLICATION_JSON)
 @Consumes(MediaType.APPLICATION_JSON)
-public class ConnectorsResource {
+public class ConnectorsResource implements ConnectResource {
     private static final Logger log = LoggerFactory.getLogger(ConnectorsResource.class);
     private static final TypeReference<List<Map<String, String>>> TASK_CONFIGS_TYPE =
         new TypeReference<List<Map<String, String>>>() { };
 
-    // TODO: This should not be so long. However, due to potentially long rebalances that may have to wait a full
-    // session timeout to complete, during which we cannot serve some requests. Ideally we could reduce this, but
-    // we need to consider all possible scenarios this could fail. It might be ok to fail with a timeout in rare cases,
-    // but currently a worker simply leaving the group can take this long as well.
-    public static final long REQUEST_TIMEOUT_MS = 90 * 1000;
-    // Mutable for integration testing; otherwise, some tests would take at least REQUEST_TIMEOUT_MS
-    // to run
-    private static long requestTimeoutMs = REQUEST_TIMEOUT_MS;
-
     private final Herder herder;
-    private final WorkerConfig config;
+    private final RestClient restClient;
+    private long requestTimeoutMs;
     @javax.ws.rs.core.Context
     private ServletContext context;
     private final boolean isTopicTrackingDisabled;
     private final boolean isTopicTrackingResetDisabled;
 
-    public ConnectorsResource(Herder herder, WorkerConfig config) {
+    public ConnectorsResource(Herder herder, WorkerConfig config, RestClient restClient) {
         this.herder = herder;
-        this.config = config;
+        this.restClient = restClient;
         isTopicTrackingDisabled = !config.getBoolean(TOPIC_TRACKING_ENABLE_CONFIG);
         isTopicTrackingResetDisabled = !config.getBoolean(TOPIC_TRACKING_ALLOW_RESET_CONFIG);
+        this.requestTimeoutMs = DEFAULT_REST_REQUEST_TIMEOUT_MS;
     }
 
-    // For testing purposes only
-    public static void setRequestTimeout(long requestTimeoutMs) {
-        ConnectorsResource.requestTimeoutMs = requestTimeoutMs;
-    }
-
-    public static void resetRequestTimeout() {
-        ConnectorsResource.requestTimeoutMs = REQUEST_TIMEOUT_MS;
+    @Override
+    public void requestTimeout(long requestTimeoutMs) {
+        if (requestTimeoutMs < 1) {
+            throw new IllegalArgumentException("REST request timeout must be positive");
+        }
+        this.requestTimeoutMs = requestTimeoutMs;
     }
 
     @GET
@@ -334,18 +327,19 @@ public class ConnectorsResource {
                                final byte[] requestBody) throws Throwable {
         List<Map<String, String>> taskConfigs = new ObjectMapper().readValue(requestBody, TASK_CONFIGS_TYPE);
         FutureCallback<Void> cb = new FutureCallback<>();
-        herder.putTaskConfigs(connector, taskConfigs, cb, InternalRequestSignature.fromHeaders(requestBody, headers));
+        herder.putTaskConfigs(connector, taskConfigs, cb, InternalRequestSignature.fromHeaders(Crypto.SYSTEM, requestBody, headers));
         completeOrForwardRequest(cb, "/connectors/" + connector + "/tasks", "POST", headers, taskConfigs, forward);
     }
 
     @PUT
     @Path("/{connector}/fence")
+    @Operation(hidden = true, summary = "This operation is only for inter-worker communications")
     public void fenceZombies(final @PathParam("connector") String connector,
                              final @Context HttpHeaders headers,
                              final @QueryParam("forward") Boolean forward,
                              final byte[] requestBody) throws Throwable {
         FutureCallback<Void> cb = new FutureCallback<>();
-        herder.fenceZombieSourceTasks(connector, cb, InternalRequestSignature.fromHeaders(requestBody, headers));
+        herder.fenceZombieSourceTasks(connector, cb, InternalRequestSignature.fromHeaders(Crypto.SYSTEM, requestBody, headers));
         completeOrForwardRequest(cb, "/connectors/" + connector + "/fence", "PUT", headers, requestBody, forward);
     }
 
@@ -411,7 +405,10 @@ public class ConnectorsResource {
             Throwable cause = e.getCause();
 
             if (cause instanceof RequestTargetException) {
-                if (forward == null || forward) {
+                if (restClient == null) {
+                    throw new ConnectRestException(Response.Status.INTERNAL_SERVER_ERROR.getStatusCode(),
+                            "Cannot complete request as non-leader with request forwarding disabled");
+                } else if (forward == null || forward) {
                     // the only time we allow recursive forwarding is when no forward flag has
                     // been set, which should only be seen by the first worker to handle a user request.
                     // this gives two total hops to resolve the request before giving up.
@@ -432,7 +429,7 @@ public class ConnectorsResource {
                     }
                     String forwardUrl = uriBuilder.build().toString();
                     log.debug("Forwarding request {} {} {}", forwardUrl, method, body);
-                    return translator.translate(RestClient.httpRequest(forwardUrl, method, headers, body, resultType, config));
+                    return translator.translate(restClient.httpRequest(forwardUrl, method, headers, body, resultType));
                 } else {
                     // we should find the right target for the query within two hops, so if
                     // we don't, it probably means that a rebalance has taken place.

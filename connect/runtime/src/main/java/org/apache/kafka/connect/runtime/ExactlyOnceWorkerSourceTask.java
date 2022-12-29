@@ -27,6 +27,7 @@ import org.apache.kafka.common.metrics.stats.Min;
 import org.apache.kafka.common.utils.Time;
 import org.apache.kafka.common.utils.Utils;
 import org.apache.kafka.connect.errors.ConnectException;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
 import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
@@ -85,6 +86,7 @@ class ExactlyOnceWorkerSourceTask extends AbstractWorkerSourceTask {
                                        WorkerConfig workerConfig,
                                        ClusterConfigState configState,
                                        ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
                                        ClassLoader loader,
                                        Time time,
                                        RetryWithToleranceOperator retryWithToleranceOperator,
@@ -95,7 +97,7 @@ class ExactlyOnceWorkerSourceTask extends AbstractWorkerSourceTask {
                                        Runnable postProducerCheck) {
         super(id, task, statusListener, initialState, keyConverter, valueConverter, headerConverter, transformationChain,
                 new WorkerSourceTaskContext(offsetReader, id, configState, buildTransactionContext(sourceConfig)),
-                producer, admin, topicGroups, offsetReader, offsetWriter, offsetStore, workerConfig, connectMetrics,
+                producer, admin, topicGroups, offsetReader, offsetWriter, offsetStore, workerConfig, connectMetrics, errorMetrics,
                 loader, time, retryWithToleranceOperator, statusBackingStore, closeExecutor);
 
         this.transactionOpen = false;
@@ -217,6 +219,9 @@ class ExactlyOnceWorkerSourceTask extends AbstractWorkerSourceTask {
         if (failed) {
             log.debug("Skipping final offset commit as task has failed");
             return;
+        } else if (isCancelled()) {
+            log.debug("Skipping final offset commit as task has been cancelled");
+            return;
         }
 
         // It should be safe to commit here even if we were in the middle of retrying on RetriableExceptions in the
@@ -275,18 +280,22 @@ class ExactlyOnceWorkerSourceTask extends AbstractWorkerSourceTask {
             });
         }
 
-        // Commit the transaction
-        // Blocks until all outstanding records have been sent and ack'd
-        try {
-            producer.commitTransaction();
-        } catch (Throwable t) {
-            log.error("{} Failed to commit producer transaction", ExactlyOnceWorkerSourceTask.this, t);
-            flushError.compareAndSet(null, t);
+        // Only commit the transaction if we were able to serialize the offsets.
+        // Otherwise, we may commit source records without committing their offsets
+        Throwable error = flushError.get();
+        if (error == null) {
+            try {
+                // Commit the transaction
+                // Blocks until all outstanding records have been sent and ack'd
+                producer.commitTransaction();
+            } catch (Throwable t) {
+                log.error("{} Failed to commit producer transaction", ExactlyOnceWorkerSourceTask.this, t);
+                flushError.compareAndSet(null, t);
+            }
+            transactionOpen = false;
         }
 
-        transactionOpen = false;
-
-        Throwable error = flushError.get();
+        error = flushError.get();
         if (error != null) {
             recordCommitFailure(time.milliseconds() - started, null);
             offsetWriter.cancelFlush();

@@ -26,7 +26,7 @@ import kafka.log._
 import kafka.metrics.KafkaMetricsGroup
 import kafka.server._
 import kafka.server.checkpoints.OffsetCheckpoints
-import kafka.server.metadata.KRaftMetadataCache
+import kafka.server.metadata.{KRaftMetadataCache, ZkMetadataCache}
 import kafka.utils.CoreUtils.{inReadLock, inWriteLock}
 import kafka.utils._
 import kafka.zookeeper.ZooKeeperClientException
@@ -44,6 +44,7 @@ import org.apache.kafka.common.utils.Time
 import org.apache.kafka.common.{IsolationLevel, TopicPartition, Uuid}
 import org.apache.kafka.metadata.LeaderRecoveryState
 import org.apache.kafka.server.common.MetadataVersion
+import org.apache.kafka.server.log.internals.{AppendOrigin, LogOffsetMetadata}
 
 import scala.collection.{Map, Seq}
 import scala.jdk.CollectionConverters._
@@ -373,7 +374,7 @@ class Partition(val topicPartition: TopicPartition,
 
   // Visible for testing
   private[cluster] def createLog(isNew: Boolean, isFutureReplica: Boolean, offsetCheckpoints: OffsetCheckpoints, topicId: Option[Uuid]): UnifiedLog = {
-    def updateHighWatermark(log: UnifiedLog) = {
+    def updateHighWatermark(log: UnifiedLog): Unit = {
       val checkpointHighWatermark = offsetCheckpoints.fetch(log.parentDir, topicPartition).getOrElse {
         info(s"No checkpointed highwatermark is found for partition $topicPartition")
         0L
@@ -808,7 +809,7 @@ class Partition(val topicPartition: TopicPartition,
   ): Unit = {
     if (isLeader) {
       val followers = replicas.filter(_ != localBrokerId)
-      val removedReplicas = remoteReplicasMap.keys.filter(!followers.contains(_))
+      val removedReplicas = remoteReplicasMap.keys.filterNot(followers.contains(_))
 
       // Due to code paths accessing remoteReplicasMap without a lock,
       // first add the new replicas and then remove the old ones
@@ -881,10 +882,15 @@ class Partition(val topicPartition: TopicPartition,
   private def isReplicaIsrEligible(followerReplicaId: Int): Boolean = {
     metadataCache match {
       // In KRaft mode, only replicas which are not fenced nor in controlled shutdown are
-      // allowed to join the ISR. This does not apply to ZK mode.
+      // allowed to join the ISR.
       case kRaftMetadataCache: KRaftMetadataCache =>
         !kRaftMetadataCache.isBrokerFenced(followerReplicaId) &&
           !kRaftMetadataCache.isBrokerShuttingDown(followerReplicaId)
+
+      // In ZK mode, we just ensure the broker is alive. Although we do not check for shutting down brokers here,
+      // the controller will block them from being added to ISR.
+      case zkMetadataCache: ZkMetadataCache =>
+        zkMetadataCache.hasAliveBroker(followerReplicaId)
 
       case _ => true
     }
@@ -952,7 +958,7 @@ class Partition(val topicPartition: TopicPartition,
    *
    * With the addition of AlterPartition, we also consider newly added replicas as part of the ISR when advancing
    * the HW. These replicas have not yet been committed to the ISR by the controller, so we could revert to the previously
-   * committed ISR. However, adding additional replicas to the ISR makes it more restrictive and therefor safe. We call
+   * committed ISR. However, adding additional replicas to the ISR makes it more restrictive and therefore safe. We call
    * this set the "maximal" ISR. See KIP-497 for more details
    *
    * Note There is no need to acquire the leaderIsrUpdate lock here since all callers of this private API acquire that lock
@@ -1205,22 +1211,32 @@ class Partition(val topicPartition: TopicPartition,
     minOneMessage: Boolean,
     updateFetchState: Boolean
   ): LogReadInfo = {
-    def readFromLocalLog(): LogReadInfo = {
+    def readFromLocalLog(log: UnifiedLog): LogReadInfo = {
       readRecords(
+        log,
         fetchPartitionData.lastFetchedEpoch,
         fetchPartitionData.fetchOffset,
         fetchPartitionData.currentLeaderEpoch,
         maxBytes,
         fetchParams.isolation,
-        minOneMessage,
-        fetchParams.fetchOnlyLeader
+        minOneMessage
       )
     }
 
     if (fetchParams.isFromFollower) {
       // Check that the request is from a valid replica before doing the read
-      val replica = followerReplicaOrThrow(fetchParams.replicaId, fetchPartitionData)
-      val logReadInfo = readFromLocalLog()
+      val (replica, logReadInfo) = inReadLock(leaderIsrUpdateLock) {
+        val localLog = localLogWithEpochOrThrow(
+          fetchPartitionData.currentLeaderEpoch,
+          fetchParams.fetchOnlyLeader
+        )
+        val replica = followerReplicaOrThrow(
+          fetchParams.replicaId,
+          fetchPartitionData
+        )
+        val logReadInfo = readFromLocalLog(localLog)
+        (replica, logReadInfo)
+      }
 
       if (updateFetchState && logReadInfo.divergingEpoch.isEmpty) {
         updateFollowerFetchState(
@@ -1234,7 +1250,13 @@ class Partition(val topicPartition: TopicPartition,
 
       logReadInfo
     } else {
-      readFromLocalLog()
+      inReadLock(leaderIsrUpdateLock) {
+        val localLog = localLogWithEpochOrThrow(
+          fetchPartitionData.currentLeaderEpoch,
+          fetchParams.fetchOnlyLeader
+        )
+        readFromLocalLog(localLog)
+      }
     }
   }
 
@@ -1270,16 +1292,14 @@ class Partition(val topicPartition: TopicPartition,
   }
 
   private def readRecords(
+    localLog: UnifiedLog,
     lastFetchedEpoch: Optional[Integer],
     fetchOffset: Long,
     currentLeaderEpoch: Optional[Integer],
     maxBytes: Int,
     fetchIsolation: FetchIsolation,
-    minOneMessage: Boolean,
-    fetchOnlyFromLeader: Boolean
-  ): LogReadInfo = inReadLock(leaderIsrUpdateLock) {
-    val localLog = localLogWithEpochOrThrow(currentLeaderEpoch, fetchOnlyFromLeader)
-
+    minOneMessage: Boolean
+  ): LogReadInfo = {
     // Note we use the log end offset prior to the read. This ensures that any appends following
     // the fetch do not prevent a follower from coming into sync.
     val initialHighWatermark = localLog.highWatermark
@@ -1375,7 +1395,7 @@ class Partition(val topicPartition: TopicPartition,
       case ListOffsetsRequest.LATEST_TIMESTAMP =>
         maybeOffsetsError.map(e => throw e)
           .orElse(Some(new TimestampAndOffset(RecordBatch.NO_TIMESTAMP, lastFetchableOffset, Optional.of(leaderEpoch))))
-      case ListOffsetsRequest.EARLIEST_TIMESTAMP =>
+      case ListOffsetsRequest.EARLIEST_TIMESTAMP | ListOffsetsRequest.EARLIEST_LOCAL_TIMESTAMP =>
         getOffsetByTimestamp
       case _ =>
         getOffsetByTimestamp.filter(timestampAndOffset => timestampAndOffset.offset < lastFetchableOffset)

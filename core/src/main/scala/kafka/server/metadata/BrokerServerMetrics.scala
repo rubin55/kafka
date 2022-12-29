@@ -17,17 +17,50 @@
 
 package kafka.server.metadata
 
-import java.util.concurrent.atomic.AtomicLong
+import kafka.metrics.KafkaMetricsGroup
+
+import java.util.concurrent.atomic.{AtomicLong, AtomicReference}
 import org.apache.kafka.common.MetricName
 import org.apache.kafka.common.metrics.Gauge
 import org.apache.kafka.common.metrics.Metrics
 import org.apache.kafka.common.metrics.MetricConfig
+import org.apache.kafka.image.MetadataProvenance
+import org.apache.kafka.image.loader.MetadataLoaderMetrics
+import org.apache.kafka.server.metrics.KafkaYammerMetrics
 
-final class BrokerServerMetrics private (metrics: Metrics) extends AutoCloseable {
+import java.util.concurrent.TimeUnit.NANOSECONDS
+
+final class BrokerServerMetrics private (
+  metrics: Metrics
+) extends MetadataLoaderMetrics with KafkaMetricsGroup {
   import BrokerServerMetrics._
 
-  val lastAppliedRecordOffset: AtomicLong = new AtomicLong(0)
-  val lastAppliedRecordTimestamp: AtomicLong = new AtomicLong(0)
+  private val batchProcessingTimeHistName = explicitMetricName("kafka.server",
+    "BrokerMetadataListener",
+    "MetadataBatchProcessingTimeUs",
+    Map.empty)
+
+  /**
+   * A histogram tracking the time in microseconds it took to process batches of events.
+   */
+  private val batchProcessingTimeHist =
+    KafkaYammerMetrics.defaultRegistry().newHistogram(batchProcessingTimeHistName, true)
+
+  private val batchSizeHistName = explicitMetricName("kafka.server",
+    "BrokerMetadataListener",
+    "MetadataBatchSizes",
+    Map.empty)
+
+  /**
+   * A histogram tracking the sizes of batches that we have processed.
+   */
+  private val batchSizeHist =
+    KafkaYammerMetrics.defaultRegistry().newHistogram(batchSizeHistName, true)
+
+  val lastAppliedImageProvenance: AtomicReference[MetadataProvenance] =
+    new AtomicReference[MetadataProvenance](MetadataProvenance.EMPTY)
+  val metadataLoadErrorCount: AtomicLong = new AtomicLong(0)
+  val metadataApplyErrorCount: AtomicLong = new AtomicLong(0)
 
   val lastAppliedRecordOffsetName = metrics.metricName(
     "last-applied-record-offset",
@@ -47,25 +80,61 @@ final class BrokerServerMetrics private (metrics: Metrics) extends AutoCloseable
     "The difference between now and the timestamp of the last record from the cluster metadata partition that was applied by the broker"
   )
 
+  val metadataLoadErrorCountName = metrics.metricName(
+    "metadata-load-error-count",
+    metricGroupName,
+    "The number of errors encountered by the BrokerMetadataListener while loading the metadata log and generating a new MetadataDelta based on it."
+  )
+
+  val metadataApplyErrorCountName = metrics.metricName(
+    "metadata-apply-error-count",
+    metricGroupName,
+    "The number of errors encountered by the BrokerMetadataPublisher while applying a new MetadataImage based on the latest MetadataDelta."
+  )
+
   addMetric(metrics, lastAppliedRecordOffsetName) { _ =>
-    lastAppliedRecordOffset.get
+    lastAppliedImageProvenance.get.offset()
   }
 
   addMetric(metrics, lastAppliedRecordTimestampName) { _ =>
-    lastAppliedRecordTimestamp.get
+    lastAppliedImageProvenance.get.lastContainedLogTimeMs()
   }
 
   addMetric(metrics, lastAppliedRecordLagMsName) { now =>
-    now - lastAppliedRecordTimestamp.get
+    now - lastAppliedImageProvenance.get.lastContainedLogTimeMs()
+  }
+
+  addMetric(metrics, metadataLoadErrorCountName) { _ =>
+    metadataLoadErrorCount.get
+  }
+
+  addMetric(metrics, metadataApplyErrorCountName) { _ =>
+    metadataApplyErrorCount.get
   }
 
   override def close(): Unit = {
+    KafkaYammerMetrics.defaultRegistry().removeMetric(batchProcessingTimeHistName)
+    KafkaYammerMetrics.defaultRegistry().removeMetric(batchSizeHistName)
     List(
       lastAppliedRecordOffsetName,
       lastAppliedRecordTimestampName,
-      lastAppliedRecordLagMsName
+      lastAppliedRecordLagMsName,
+      metadataLoadErrorCountName,
+      metadataApplyErrorCountName
     ).foreach(metrics.removeMetric)
   }
+
+  override def updateBatchProcessingTime(elapsedNs: Long): Unit =
+    batchProcessingTimeHist.update(NANOSECONDS.toMicros(elapsedNs))
+
+  override def updateBatchSize(size: Int): Unit = batchSizeHist.update(size)
+
+  override def updateLastAppliedImageProvenance(provenance: MetadataProvenance): Unit =
+    lastAppliedImageProvenance.set(provenance)
+
+  override def lastAppliedOffset(): Long = lastAppliedImageProvenance.get().offset()
+
+  def lastAppliedTimestamp(): Long = lastAppliedImageProvenance.get().lastContainedLogTimeMs()
 }
 
 

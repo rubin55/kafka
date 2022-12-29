@@ -34,22 +34,24 @@ import org.apache.kafka.streams.integration.utils.EmbeddedKafkaCluster;
 import org.apache.kafka.streams.integration.utils.IntegrationTestUtils;
 import org.apache.kafka.streams.kstream.Consumed;
 import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.processor.StreamPartitioner;
 import org.apache.kafka.streams.processor.internals.namedtopology.KafkaStreamsNamedTopologyWrapper;
 import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopologyBuilder;
 import org.apache.kafka.streams.processor.internals.namedtopology.NamedTopologyStoreQueryParameters;
 import org.apache.kafka.streams.state.KeyValueStore;
 import org.apache.kafka.streams.state.QueryableStoreType;
 import org.apache.kafka.streams.state.ReadOnlyKeyValueStore;
-import org.apache.kafka.test.IntegrationTest;
 import org.apache.kafka.test.TestCondition;
 import org.apache.kafka.test.TestUtils;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Rule;
-import org.junit.Test;
-import org.junit.experimental.categories.Category;
-import org.junit.rules.TestName;
-import org.junit.rules.Timeout;
+import org.hamcrest.Matcher;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Tag;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.TestInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,6 +66,8 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
+import java.util.Set;
+import java.util.Collections;
 
 import static java.util.Collections.singletonList;
 import static org.apache.kafka.streams.integration.utils.IntegrationTestUtils.getStore;
@@ -80,11 +84,11 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.anyOf;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
-@Category({IntegrationTest.class})
+@Timeout(600)
+@Tag("integration")
 public class StoreQueryIntegrationTest {
-    @Rule
-    public Timeout globalTimeout = Timeout.seconds(600);
 
     private static final Logger LOG = LoggerFactory.getLogger(StoreQueryIntegrationTest.class);
 
@@ -93,26 +97,35 @@ public class StoreQueryIntegrationTest {
     private static final String INPUT_TOPIC_NAME = "input-topic";
     private static final String TABLE_NAME = "source-table";
 
-    public final EmbeddedKafkaCluster cluster = new EmbeddedKafkaCluster(NUM_BROKERS);
+    public final static EmbeddedKafkaCluster CLUSTER = new EmbeddedKafkaCluster(NUM_BROKERS);
 
-    @Rule
-    public TestName testName = new TestName();
+    private String appId;
 
     private final List<KafkaStreams> streamsToCleanup = new ArrayList<>();
-    private final MockTime mockTime = cluster.time;
+    private final MockTime mockTime = CLUSTER.time;
 
-    @Before
-    public void before() throws InterruptedException, IOException {
-        cluster.start();
-        cluster.createTopic(INPUT_TOPIC_NAME, 2, 1);
+    @BeforeAll
+    public static void setupCluster() throws InterruptedException, IOException {
+        CLUSTER.start();
+        CLUSTER.createTopic(INPUT_TOPIC_NAME, 2, 1);
     }
 
-    @After
+    @BeforeEach
+    public void before(final TestInfo testInfo) throws InterruptedException, IOException {
+        this.appId = safeUniqueTestName(getClass(), testInfo);
+    }
+
+    @AfterEach
     public void after() {
         for (final KafkaStreams kafkaStreams : streamsToCleanup) {
             kafkaStreams.close();
         }
-        cluster.stop();
+        streamsToCleanup.clear();
+    }
+
+    @AfterAll
+    public static void stopCluster() {
+        CLUSTER.stop();
     }
 
     @Test
@@ -125,6 +138,7 @@ public class StoreQueryIntegrationTest {
         getStreamsBuilderWithTopology(builder, semaphore);
 
         final KafkaStreams kafkaStreams1 = createKafkaStreams(builder, streamsConfiguration());
+        final int kafkaStreams1Port = port;
         final KafkaStreams kafkaStreams2 = createKafkaStreams(builder, streamsConfiguration());
         final List<KafkaStreams> kafkaStreamsList = Arrays.asList(kafkaStreams1, kafkaStreams2);
 
@@ -142,7 +156,7 @@ public class StoreQueryIntegrationTest {
             final ReadOnlyKeyValueStore<Integer, Integer> store1 = getStore(TABLE_NAME, kafkaStreams1, queryableStoreType);
             final ReadOnlyKeyValueStore<Integer, Integer> store2 = getStore(TABLE_NAME, kafkaStreams2, queryableStoreType);
 
-            final boolean kafkaStreams1IsActive = (keyQueryMetadata.activeHost().port() % 2) == 1;
+            final boolean kafkaStreams1IsActive = keyQueryMetadata.activeHost().port() == kafkaStreams1Port;
 
             try {
                 if (kafkaStreams1IsActive) {
@@ -154,7 +168,7 @@ public class StoreQueryIntegrationTest {
                 }
                 return true;
             } catch (final InvalidStateStoreException exception) {
-                verifyRetrievableException(exception);
+                verifyRetriableException(exception);
                 LOG.info("Either streams wasn't running or a re-balancing took place. Will try again.");
                 return false;
             }
@@ -171,6 +185,7 @@ public class StoreQueryIntegrationTest {
         getStreamsBuilderWithTopology(builder, semaphore);
 
         final KafkaStreams kafkaStreams1 = createKafkaStreams(builder, streamsConfiguration());
+        final int kafkaStreams1Port = port;
         final KafkaStreams kafkaStreams2 = createKafkaStreams(builder, streamsConfiguration());
         final List<KafkaStreams> kafkaStreamsList = Arrays.asList(kafkaStreams1, kafkaStreams2);
 
@@ -188,7 +203,7 @@ public class StoreQueryIntegrationTest {
 
             //key doesn't belongs to this partition
             final int keyDontBelongPartition = (keyPartition == 0) ? 1 : 0;
-            final boolean kafkaStreams1IsActive = (keyQueryMetadata.activeHost().port() % 2) == 1;
+            final boolean kafkaStreams1IsActive = keyQueryMetadata.activeHost().port() == kafkaStreams1Port;
 
             final StoreQueryParameters<ReadOnlyKeyValueStore<Integer, Integer>> storeQueryParam =
                 StoreQueryParameters.<ReadOnlyKeyValueStore<Integer, Integer>>fromNameAndType(TABLE_NAME, keyValueStore())
@@ -238,7 +253,7 @@ public class StoreQueryIntegrationTest {
                 }
                 return true;
             } catch (final InvalidStateStoreException exception) {
-                verifyRetrievableException(exception);
+                verifyRetriableException(exception);
                 LOG.info("Either streams wasn't running or a re-balancing took place. Will try again.");
                 return false;
             }
@@ -507,7 +522,7 @@ public class StoreQueryIntegrationTest {
                 assertThat(store1.get(key3), is(notNullValue()));
                 return true;
             } catch (final InvalidStateStoreException exception) {
-                verifyRetrievableException(exception);
+                verifyRetriableException(exception);
                 LOG.info("Either streams wasn't running or a re-balancing took place. Will try again.");
                 return false;
             }
@@ -528,31 +543,71 @@ public class StoreQueryIntegrationTest {
                 assertThat(store1.get(key3), is(notNullValue()));
                 return true;
             } catch (final InvalidStateStoreException exception) {
-                verifyRetrievableException(exception);
+                verifyRetriableException(exception);
                 LOG.info("Either streams wasn't running or a re-balancing took place. Will try again.");
                 return false;
             }
         });
     }
 
-    private void verifyRetrievableException(final Exception exception) {
+    @Test
+    public void shouldFailWithIllegalArgumentExceptionWhenIQPartitionerReturnsMultiplePartitions() throws Exception {
+
+        class BroadcastingPartitioner implements StreamPartitioner<Integer, String> {
+            @Override
+            @Deprecated
+            public Integer partition(final String topic, final Integer key, final String value, final int numPartitions) {
+                return null;
+            }
+
+            @Override
+            public Optional<Set<Integer>> partitions(final String topic, final Integer key, final String value, final int numPartitions) {
+                return Optional.of(IntStream.range(0, numPartitions).boxed().collect(Collectors.toSet()));
+            }
+        }
+
+        final int batch1NumMessages = 1;
+        final int key = 1;
+        final Semaphore semaphore = new Semaphore(0);
+
+        final StreamsBuilder builder = new StreamsBuilder();
+        getStreamsBuilderWithTopology(builder, semaphore);
+
+        final KafkaStreams kafkaStreams1 = createKafkaStreams(builder, streamsConfiguration());
+
+        startApplicationAndWaitUntilRunning(Collections.singletonList(kafkaStreams1), Duration.ofSeconds(60));
+        produceValueRange(key, 0, batch1NumMessages);
+
+        assertThat(semaphore.tryAcquire(batch1NumMessages, 60, TimeUnit.SECONDS), is(equalTo(true)));
+
+        assertThrows(IllegalArgumentException.class, () -> kafkaStreams1.queryMetadataForKey(TABLE_NAME, key, new BroadcastingPartitioner()));
+    }
+
+
+    private Matcher<String> retriableException() {
+        return is(
+            anyOf(
+                containsString("Cannot get state store source-table because the stream thread is PARTITIONS_ASSIGNED, not RUNNING"),
+                containsString("The state store, source-table, may have migrated to another instance"),
+                containsString("Cannot get state store source-table because the stream thread is STARTING, not RUNNING"),
+                containsString("The specified partition 1 for store source-table does not exist.")
+            )
+        );
+    }
+
+    private void verifyRetriableException(final Exception exception) {
         assertThat(
             "Unexpected exception thrown while getting the value from store.",
             exception.getMessage(),
-            is(
-                anyOf(
-                    containsString("Cannot get state store source-table because the stream thread is PARTITIONS_ASSIGNED, not RUNNING"),
-                    containsString("The state store, source-table, may have migrated to another instance"),
-                    containsString("Cannot get state store source-table because the stream thread is STARTING, not RUNNING")
-                )
-            )
+            retriableException()
         );
     }
 
     private static void until(final TestCondition condition) {
         boolean success = false;
         final long deadline = System.currentTimeMillis() + IntegrationTestUtils.DEFAULT_TIMEOUT;
-        while (!success && System.currentTimeMillis() < deadline) {
+        boolean deadlineExceeded = System.currentTimeMillis() >= deadline;
+        while (!success && !deadlineExceeded) {
             try {
                 success = condition.conditionMet();
                 Thread.sleep(500L);
@@ -560,7 +615,12 @@ public class StoreQueryIntegrationTest {
                 throw e;
             } catch (final Exception e) {
                 throw new RuntimeException(e);
+            } finally {
+                deadlineExceeded = System.currentTimeMillis() >= deadline;
             }
+        }
+        if (deadlineExceeded) {
+            fail("Test execution timed out");
         }
     }
 
@@ -585,7 +645,7 @@ public class StoreQueryIntegrationTest {
 
     private void produceValueRange(final int key, final int start, final int endExclusive) {
         final Properties producerProps = new Properties();
-        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers());
+        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
         producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
         producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, IntegerSerializer.class);
 
@@ -599,12 +659,11 @@ public class StoreQueryIntegrationTest {
     }
 
     private Properties streamsConfiguration() {
-        final String safeTestName = safeUniqueTestName(getClass(), testName);
         final Properties config = new Properties();
         config.put(StreamsConfig.TOPOLOGY_OPTIMIZATION_CONFIG, StreamsConfig.OPTIMIZE);
-        config.put(StreamsConfig.APPLICATION_ID_CONFIG, "app-" + safeTestName);
+        config.put(StreamsConfig.APPLICATION_ID_CONFIG, "app-" + appId);
         config.put(StreamsConfig.APPLICATION_SERVER_CONFIG, "localhost:" + (++port));
-        config.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, cluster.bootstrapServers());
+        config.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, CLUSTER.bootstrapServers());
         config.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getPath());
         config.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.Integer().getClass());
         config.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.Integer().getClass());

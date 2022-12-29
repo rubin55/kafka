@@ -20,11 +20,9 @@ package org.apache.kafka.controller;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Map.Entry;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.TreeMap;
 import java.util.function.Consumer;
@@ -52,7 +50,8 @@ public class FeatureControlManager {
         private LogContext logContext = null;
         private SnapshotRegistry snapshotRegistry = null;
         private QuorumFeatures quorumFeatures = null;
-        private MetadataVersion metadataVersion = MetadataVersion.MINIMUM_KRAFT_VERSION;
+        private MetadataVersion metadataVersion = MetadataVersion.latest();
+        private MetadataVersion minimumBootstrapVersion = MetadataVersion.MINIMUM_BOOTSTRAP_VERSION;
 
         Builder setLogContext(LogContext logContext) {
             this.logContext = logContext;
@@ -74,6 +73,11 @@ public class FeatureControlManager {
             return this;
         }
 
+        Builder setMinimumBootstrapVersion(MetadataVersion minimumBootstrapVersion) {
+            this.minimumBootstrapVersion = minimumBootstrapVersion;
+            return this;
+        }
+
         public FeatureControlManager build() {
             if (logContext == null) logContext = new LogContext();
             if (snapshotRegistry == null) snapshotRegistry = new SnapshotRegistry(logContext);
@@ -84,7 +88,8 @@ public class FeatureControlManager {
             return new FeatureControlManager(logContext,
                 quorumFeatures,
                 snapshotRegistry,
-                metadataVersion);
+                metadataVersion,
+                minimumBootstrapVersion);
         }
     }
 
@@ -106,21 +111,22 @@ public class FeatureControlManager {
     private final TimelineObject<MetadataVersion> metadataVersion;
 
     /**
-     * A boolean to see if we have encountered a metadata.version or not.
+     * The minimum bootstrap version that we can't downgrade before.
      */
-    private final TimelineObject<Boolean> sawMetadataVersion;
+    private final MetadataVersion minimumBootstrapVersion;
 
     private FeatureControlManager(
         LogContext logContext,
         QuorumFeatures quorumFeatures,
         SnapshotRegistry snapshotRegistry,
-        MetadataVersion metadataVersion
+        MetadataVersion metadataVersion,
+        MetadataVersion minimumBootstrapVersion
     ) {
         this.log = logContext.logger(FeatureControlManager.class);
         this.quorumFeatures = quorumFeatures;
         this.finalizedVersions = new TimelineHashMap<>(snapshotRegistry, 0);
         this.metadataVersion = new TimelineObject<>(snapshotRegistry, metadataVersion);
-        this.sawMetadataVersion = new TimelineObject<>(snapshotRegistry, false);
+        this.minimumBootstrapVersion = minimumBootstrapVersion;
     }
 
     ControllerResult<Map<String, ApiError>> updateFeatures(
@@ -159,11 +165,11 @@ public class FeatureControlManager {
                 "The controller does not support the given upgrade type.");
         }
 
-        final Short currentVersion;
+        final short currentVersion;
         if (featureName.equals(MetadataVersion.FEATURE_NAME)) {
             currentVersion = metadataVersion.get().featureLevel();
         } else {
-            currentVersion = finalizedVersions.get(featureName);
+            currentVersion = finalizedVersions.getOrDefault(featureName, (short) 0);
         }
 
         if (newVersion < 0) {
@@ -188,11 +194,15 @@ public class FeatureControlManager {
             }
         }
 
-        if (currentVersion != null && newVersion < currentVersion) {
+        if (newVersion < currentVersion) {
             if (upgradeType.equals(FeatureUpdate.UpgradeType.UPGRADE)) {
                 return invalidUpdateVersion(featureName, newVersion,
                     "Can't downgrade the version of this feature without setting the " +
                     "upgrade type to either safe or unsafe downgrade.");
+            }
+        } else if (newVersion > currentVersion) {
+            if (!upgradeType.equals(FeatureUpdate.UpgradeType.UPGRADE)) {
+                return invalidUpdateVersion(featureName, newVersion, "Can't downgrade to a newer version.");
             }
         }
 
@@ -200,11 +210,9 @@ public class FeatureControlManager {
             // Perform additional checks if we're updating metadata.version
             return updateMetadataVersion(newVersion, upgradeType.equals(FeatureUpdate.UpgradeType.UNSAFE_DOWNGRADE), records::add);
         } else {
-            records.add(new ApiMessageAndVersion(
-                new FeatureLevelRecord()
-                    .setName(featureName)
-                    .setFeatureLevel(newVersion),
-                FEATURE_LEVEL_RECORD.highestSupportedVersion()));
+            records.add(new ApiMessageAndVersion(new FeatureLevelRecord().
+                setName(featureName).
+                setFeatureLevel(newVersion), (short) 0));
             return ApiError.NONE;
         }
     }
@@ -231,13 +239,20 @@ public class FeatureControlManager {
             return invalidMetadataVersion(newVersionLevel, "Unknown metadata.version.");
         }
 
+        // We cannot set a version earlier than IBP_3_3_IV0, since that was the first version that contained
+        // FeatureLevelRecord itself.
+        if (newVersion.isLessThan(minimumBootstrapVersion)) {
+            return invalidMetadataVersion(newVersionLevel, "Unable to set a metadata.version less than " +
+                    minimumBootstrapVersion);
+        }
         if (newVersion.isLessThan(currentVersion)) {
             // This is a downgrade
             boolean metadataChanged = MetadataVersion.checkIfMetadataChanged(currentVersion, newVersion);
             if (!metadataChanged) {
                 log.info("Downgrading metadata.version from {} to {}.", currentVersion, newVersion);
             } else if (allowUnsafeDowngrade) {
-                log.info("Downgrading metadata.version unsafely from {} to {}.", currentVersion, newVersion);
+                return invalidMetadataVersion(newVersionLevel, "Unsafe metadata downgrade is not supported " +
+                        "in this version.");
             } else {
                 return invalidMetadataVersion(newVersionLevel, "Refusing to perform the requested " +
                         "downgrade because it might delete metadata information. Retry using " +
@@ -269,13 +284,6 @@ public class FeatureControlManager {
         return new FinalizedControllerFeatures(features, epoch);
     }
 
-    /**
-     * @return true if a FeatureLevelRecord for "metadata.version" has been replayed. False otherwise
-     */
-    boolean sawMetadataVersion() {
-        return this.sawMetadataVersion.get();
-    }
-
     public void replay(FeatureLevelRecord record) {
         VersionRange range = quorumFeatures.localSupportedFeature(record.name());
         if (!range.contains(record.featureLevel())) {
@@ -285,7 +293,6 @@ public class FeatureControlManager {
         if (record.name().equals(MetadataVersion.FEATURE_NAME)) {
             log.info("Setting metadata.version to {}", record.featureLevel());
             metadataVersion.set(MetadataVersion.fromFeatureLevel(record.featureLevel()));
-            sawMetadataVersion.set(true);
         } else {
             if (record.featureLevel() == 0) {
                 log.info("Removing feature {}", record.name());
@@ -297,40 +304,7 @@ public class FeatureControlManager {
         }
     }
 
-    class FeatureControlIterator implements Iterator<List<ApiMessageAndVersion>> {
-        private final Iterator<Entry<String, Short>> iterator;
-        private final MetadataVersion metadataVersion;
-        private boolean wroteVersion = false;
-
-        FeatureControlIterator(long epoch) {
-            this.iterator = finalizedVersions.entrySet(epoch).iterator();
-            this.metadataVersion = FeatureControlManager.this.metadataVersion.get(epoch);
-        }
-
-        @Override
-        public boolean hasNext() {
-            return !wroteVersion || iterator.hasNext();
-        }
-
-        @Override
-        public List<ApiMessageAndVersion> next() {
-            // Write the metadata.version first
-            if (!wroteVersion) {
-                wroteVersion = true;
-                return Collections.singletonList(new ApiMessageAndVersion(new FeatureLevelRecord()
-                    .setName(MetadataVersion.FEATURE_NAME)
-                    .setFeatureLevel(metadataVersion.featureLevel()), FEATURE_LEVEL_RECORD.lowestSupportedVersion()));
-            }
-            // Then write the rest of the features
-            if (!hasNext()) throw new NoSuchElementException();
-            Entry<String, Short> entry = iterator.next();
-            return Collections.singletonList(new ApiMessageAndVersion(new FeatureLevelRecord()
-                .setName(entry.getKey())
-                .setFeatureLevel(entry.getValue()), FEATURE_LEVEL_RECORD.highestSupportedVersion()));
-        }
-    }
-
-    FeatureControlIterator iterator(long epoch) {
-        return new FeatureControlIterator(epoch);
+    boolean isControllerId(int nodeId) {
+        return quorumFeatures.isControllerId(nodeId);
     }
 }

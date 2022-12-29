@@ -23,7 +23,7 @@ import java.util.Date
 import java.util.concurrent.TimeUnit
 import kafka.common._
 import kafka.metrics.KafkaMetricsGroup
-import kafka.server.{BrokerReconfigurable, KafkaConfig, LogDirFailureChannel}
+import kafka.server.{BrokerReconfigurable, KafkaConfig}
 import kafka.utils._
 import org.apache.kafka.common.{KafkaException, TopicPartition}
 import org.apache.kafka.common.config.ConfigException
@@ -32,6 +32,7 @@ import org.apache.kafka.common.record.MemoryRecords.RecordFilter
 import org.apache.kafka.common.record.MemoryRecords.RecordFilter.BatchRetention
 import org.apache.kafka.common.record._
 import org.apache.kafka.common.utils.{BufferSupplier, Time}
+import org.apache.kafka.server.log.internals.{AbortedTxn, LogDirFailureChannel, OffsetMap, SkimpyOffsetMap, TransactionIndex}
 
 import scala.jdk.CollectionConverters._
 import scala.collection.mutable.ListBuffer
@@ -104,7 +105,7 @@ class LogCleaner(initialConfig: CleanerConfig,
   private[log] val cleanerManager = new LogCleanerManager(logDirs, logs, logDirFailureChannel)
 
   /* a throttle used to limit the I/O of all the cleaner threads to a user-specified maximum rate */
-  private val throttler = new Throttler(desiredRatePerSec = config.maxIoBytesPerSecond,
+  private[log] val throttler = new Throttler(desiredRatePerSec = config.maxIoBytesPerSecond,
                                         checkIntervalMs = 300,
                                         throttleDown = true,
                                         "cleaner-io",
@@ -186,11 +187,20 @@ class LogCleaner(initialConfig: CleanerConfig,
   }
 
   /**
-    * Reconfigure log clean config. This simply stops current log cleaners and creates new ones.
+    * Reconfigure log clean config. The will:
+    * 1. update desiredRatePerSec in Throttler with logCleanerIoMaxBytesPerSecond, if necessary 
+    * 2. stop current log cleaners and create new ones.
     * That ensures that if any of the cleaners had failed, new cleaners are created to match the new config.
     */
   override def reconfigure(oldConfig: KafkaConfig, newConfig: KafkaConfig): Unit = {
     config = LogCleaner.cleanerConfig(newConfig)
+
+    val maxIoBytesPerSecond = config.maxIoBytesPerSecond;
+    if (maxIoBytesPerSecond != oldConfig.logCleanerIoMaxBytesPerSecond) {
+      info(s"Updating logCleanerIoMaxBytesPerSecond: $maxIoBytesPerSecond")
+      throttler.updateDesiredRatePerSec(maxIoBytesPerSecond)
+    }
+
     shutdown()
     startup()
   }
@@ -297,8 +307,8 @@ class LogCleaner(initialConfig: CleanerConfig,
       warn("Cannot use more than 2G of cleaner buffer space per cleaner thread, ignoring excess buffer space...")
 
     val cleaner = new Cleaner(id = threadId,
-                              offsetMap = new SkimpyOffsetMap(memory = math.min(config.dedupeBufferSize / config.numThreads, Int.MaxValue).toInt,
-                                                              hashAlgorithm = config.hashAlgorithm),
+                              offsetMap = new SkimpyOffsetMap(math.min(config.dedupeBufferSize / config.numThreads, Int.MaxValue).toInt,
+                                                              config.hashAlgorithm),
                               ioBufferSize = config.ioBufferSize / config.numThreads / 2,
                               maxIoBufferSize = config.maxMessageSize,
                               dupBufferLoadFactor = config.dedupeBufferLoadFactor,
@@ -692,6 +702,8 @@ private[log] class Cleaner(val id: Int,
         if (discardBatchRecords)
           // The batch is only retained to preserve producer sequence information; the records can be removed
           false
+        else if (batch.isControlBatch)
+          true
         else
           Cleaner.this.shouldRetainRecord(map, retainLegacyDeletesAndTxnMarkers, batch, record, stats, currentTime = currentTime)
       }
@@ -777,7 +789,7 @@ private[log] class Cleaner(val id: Int,
       transactionMetadata.onBatchRead(batch)
   }
 
-  private def shouldRetainRecord(map: kafka.log.OffsetMap,
+  private def shouldRetainRecord(map: OffsetMap,
                                  retainDeletesForLegacyRecords: Boolean,
                                  batch: RecordBatch,
                                  record: Record,
@@ -1112,7 +1124,7 @@ private[log] class CleanedTransactionMetadata {
   private val ongoingAbortedTxns = mutable.Map.empty[Long, AbortedTransactionMetadata]
   // Minheap of aborted transactions sorted by the transaction first offset
   private val abortedTransactions = mutable.PriorityQueue.empty[AbortedTxn](new Ordering[AbortedTxn] {
-    override def compare(x: AbortedTxn, y: AbortedTxn): Int = x.firstOffset compare y.firstOffset
+    override def compare(x: AbortedTxn, y: AbortedTxn): Int = java.lang.Long.compare(x.firstOffset, y.firstOffset)
   }.reverse)
 
   // Output cleaned index to write retained aborted transactions

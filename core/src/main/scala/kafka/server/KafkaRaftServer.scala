@@ -21,22 +21,19 @@ import java.util.concurrent.CompletableFuture
 import kafka.common.InconsistentNodeIdException
 import kafka.log.{LogConfig, UnifiedLog}
 import kafka.metrics.KafkaMetricsReporter
-import kafka.raft.KafkaRaftManager
 import kafka.server.KafkaRaftServer.{BrokerRole, ControllerRole}
 import kafka.utils.{CoreUtils, Logging, Mx4jLoader, VerifiableProperties}
 import org.apache.kafka.common.config.{ConfigDef, ConfigResource}
 import org.apache.kafka.common.internals.Topic
 import org.apache.kafka.common.utils.{AppInfoParser, Time}
 import org.apache.kafka.common.{KafkaException, Uuid}
-import org.apache.kafka.controller.BootstrapMetadata
-import org.apache.kafka.metadata.{KafkaConfigSchema, MetadataRecordSerde}
+import org.apache.kafka.metadata.bootstrap.{BootstrapDirectory, BootstrapMetadata}
+import org.apache.kafka.metadata.KafkaConfigSchema
 import org.apache.kafka.raft.RaftConfig
-import org.apache.kafka.server.common.{ApiMessageAndVersion, MetadataVersion}
 import org.apache.kafka.server.metrics.KafkaYammerMetrics
 
-import java.nio.file.Paths
+import java.util.Optional
 import scala.collection.Seq
-import scala.compat.java8.FunctionConverters.asJavaSupplier
 import scala.jdk.CollectionConverters._
 
 /**
@@ -45,8 +42,6 @@ import scala.jdk.CollectionConverters._
  * constructing the controller and/or broker based on the `process.roles`
  * configuration and for managing their basic lifecycle (startup and shutdown).
  *
- * Note that this server is a work in progress and we are releasing it as
- * early access in 2.8.0.
  */
 class KafkaRaftServer(
   config: KafkaConfig,
@@ -54,6 +49,7 @@ class KafkaRaftServer(
   threadNamePrefix: Option[String]
 ) extends Server with Logging {
 
+  this.logIdent = s"[KafkaRaftServer nodeId=${config.nodeId}] "
   KafkaMetricsReporter.startReporters(VerifiableProperties(config.originals))
   KafkaYammerMetrics.INSTANCE.configure(config.originals)
 
@@ -68,28 +64,20 @@ class KafkaRaftServer(
   private val controllerQuorumVotersFuture = CompletableFuture.completedFuture(
     RaftConfig.parseVoterConnections(config.quorumVoters))
 
-  private val raftManager = new KafkaRaftManager[ApiMessageAndVersion](
-    metaProps,
+  private val sharedServer = new SharedServer(
     config,
-    new MetadataRecordSerde,
-    KafkaRaftServer.MetadataPartition,
-    KafkaRaftServer.MetadataTopicId,
+    metaProps,
     time,
     metrics,
     threadNamePrefix,
-    controllerQuorumVotersFuture
+    controllerQuorumVotersFuture,
+    new StandardFaultHandlerFactory(),
   )
 
   private val broker: Option[BrokerServer] = if (config.processRoles.contains(BrokerRole)) {
     Some(new BrokerServer(
-      config,
-      metaProps,
-      raftManager,
-      time,
-      metrics,
-      threadNamePrefix,
-      offlineDirs,
-      controllerQuorumVotersFuture
+      sharedServer,
+      offlineDirs
     ))
   } else {
     None
@@ -97,16 +85,9 @@ class KafkaRaftServer(
 
   private val controller: Option[ControllerServer] = if (config.processRoles.contains(ControllerRole)) {
     Some(new ControllerServer(
-      metaProps,
-      config,
-      raftManager,
-      time,
-      metrics,
-      threadNamePrefix,
-      controllerQuorumVotersFuture,
+      sharedServer,
       KafkaRaftServer.configSchema,
-      raftManager.apiVersions,
-      bootstrapMetadata
+      bootstrapMetadata,
     ))
   } else {
     None
@@ -114,7 +95,6 @@ class KafkaRaftServer(
 
   override def startup(): Unit = {
     Mx4jLoader.maybeLoad()
-    raftManager.startup()
     controller.foreach(_.startup())
     broker.foreach(_.startup())
     AppInfoParser.registerAppInfo(Server.MetricsPrefix, config.brokerId.toString, metrics, time.milliseconds())
@@ -122,23 +102,23 @@ class KafkaRaftServer(
   }
 
   override def shutdown(): Unit = {
+    // In combined mode, we want to shut down the broker first, since the controller may be
+    // needed for controlled shutdown. Additionally, the controller shutdown process currently
+    // stops the raft client early on, which would disrupt broker shutdown.
     broker.foreach(_.shutdown())
-    raftManager.shutdown()
     controller.foreach(_.shutdown())
     CoreUtils.swallow(AppInfoParser.unregisterAppInfo(Server.MetricsPrefix, config.brokerId.toString, metrics), this)
-
   }
 
   override def awaitShutdown(): Unit = {
     broker.foreach(_.awaitShutdown())
     controller.foreach(_.awaitShutdown())
   }
-
 }
 
 object KafkaRaftServer {
-  val MetadataTopic = Topic.METADATA_TOPIC_NAME
-  val MetadataPartition = Topic.METADATA_TOPIC_PARTITION
+  val MetadataTopic = Topic.CLUSTER_METADATA_TOPIC_NAME
+  val MetadataPartition = Topic.CLUSTER_METADATA_TOPIC_PARTITION
   val MetadataTopicId = Uuid.METADATA_TOPIC_ID
 
   sealed trait ProcessRole
@@ -182,16 +162,9 @@ object KafkaRaftServer {
           "If you intend to create a new broker, you should remove all data in your data directories (log.dirs).")
     }
 
-    // Load the bootstrap metadata file. In the case of an upgrade from older KRaft where there is no bootstrap metadata,
-    // read the IBP from config in order to bootstrap the equivalent metadata version.
-    def getUserDefinedIBPVersionOrThrow(): MetadataVersion = {
-      if (config.originals.containsKey(KafkaConfig.InterBrokerProtocolVersionProp)) {
-        MetadataVersion.fromVersionString(config.interBrokerProtocolVersionString)
-      } else {
-        throw new KafkaException(s"Cannot upgrade from KRaft version prior to 3.3 without first setting ${KafkaConfig.InterBrokerProtocolVersionProp} on each broker.")
-      }
-    }
-    val bootstrapMetadata = BootstrapMetadata.load(Paths.get(config.metadataLogDir), asJavaSupplier(() => getUserDefinedIBPVersionOrThrow()))
+    val bootstrapDirectory = new BootstrapDirectory(config.metadataLogDir,
+      Optional.ofNullable(config.interBrokerProtocolVersionString))
+    val bootstrapMetadata = bootstrapDirectory.read()
 
     (metaProperties, bootstrapMetadata, offlineDirs.toSeq)
   }

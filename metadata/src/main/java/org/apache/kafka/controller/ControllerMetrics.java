@@ -35,9 +35,9 @@ public interface ControllerMetrics extends AutoCloseable {
 
     int activeBrokerCount();
 
-    void setGlobalTopicsCount(int topicCount);
+    void setGlobalTopicCount(int topicCount);
 
-    int globalTopicsCount();
+    int globalTopicCount();
 
     void setGlobalPartitionCount(int partitionCount);
 
@@ -50,6 +50,10 @@ public interface ControllerMetrics extends AutoCloseable {
     void setPreferredReplicaImbalanceCount(int replicaImbalances);
 
     int preferredReplicaImbalanceCount();
+
+    void incrementMetadataErrorCount();
+
+    int metadataErrorCount();
 
     void setLastAppliedRecordOffset(long offset);
 

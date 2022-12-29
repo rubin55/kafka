@@ -32,9 +32,45 @@ import org.apache.kafka.common.requests.MetadataResponse
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.ValueSource
+
+import scala.collection.Seq
 import scala.jdk.CollectionConverters._
 
 class DeleteTopicsRequestTest extends BaseRequestTest with Logging {
+
+  @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
+  @ValueSource(strings = Array("zk", "kraft"))
+  def testTopicDeletionClusterHasOfflinePartitions(quorum: String): Unit = {
+    // Create a two topics with one partition/replica. Make one of them offline.
+    val offlineTopic = "topic-1"
+    val onlineTopic = "topic-2"
+    createTopicWithAssignment(offlineTopic, Map[Int, Seq[Int]](0 -> Seq(0)))
+    createTopicWithAssignment(onlineTopic, Map[Int, Seq[Int]](0 -> Seq(1)))
+    killBroker(0)
+    ensureConsistentKRaftMetadata()
+
+    // Ensure one topic partition is offline.
+    TestUtils.waitUntilTrue(() => {
+      aliveBrokers.head.metadataCache.getPartitionInfo(onlineTopic, 0).exists(_.leader() == 1) &&
+        aliveBrokers.head.metadataCache.getPartitionInfo(offlineTopic, 0).exists(_.leader() ==
+          MetadataResponse.NO_LEADER_ID)
+    }, "Topic partition is not offline")
+
+    // Delete the newly created topic and topic with offline partition. See the deletion is
+    // successful.
+    deleteTopic(onlineTopic)
+    deleteTopic(offlineTopic)
+    ensureConsistentKRaftMetadata()
+
+    // Restart the dead broker.
+    restartDeadBrokers()
+
+    // Make sure the brokers no longer see any deleted topics.
+    TestUtils.waitUntilTrue(() =>
+      !aliveBrokers.forall(_.metadataCache.contains(onlineTopic)) &&
+        !aliveBrokers.forall(_.metadataCache.contains(offlineTopic)),
+      "The topics are found in the Broker's cache")
+  }
 
   @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
   @ValueSource(strings = Array("zk", "kraft"))
@@ -185,7 +221,7 @@ class DeleteTopicsRequestTest extends BaseRequestTest with Logging {
    * Instead, the request is forwarded.
    */
   @ParameterizedTest(name = TestInfoUtils.TestWithParameterizedQuorumName)
-  @ValueSource(strings = Array("zk"))
+  @ValueSource(strings = Array("zk", "zkMigration"))
   def testNotController(quorum: String): Unit = {
     val request = new DeleteTopicsRequest.Builder(
         new DeleteTopicsRequestData()
@@ -193,8 +229,9 @@ class DeleteTopicsRequestTest extends BaseRequestTest with Logging {
           .setTimeoutMs(1000)).build()
     val response = sendDeleteTopicsRequest(request, notControllerSocketServer)
 
+    val expectedError = if (isZkMigrationTest()) Errors.NONE else Errors.NOT_CONTROLLER
     val error = response.data.responses.find("not-controller").errorCode()
-    assertEquals(Errors.NOT_CONTROLLER.code,  error, "Expected controller error when routed incorrectly")
+    assertEquals(expectedError.code(),  error)
   }
 
   private def validateTopicIsDeleted(topic: String): Unit = {

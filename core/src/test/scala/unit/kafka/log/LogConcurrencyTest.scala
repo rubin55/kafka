@@ -20,10 +20,11 @@ package kafka.log
 import java.util.Properties
 import java.util.concurrent.{Callable, Executors}
 
-import kafka.server.{BrokerTopicStats, FetchHighWatermark, LogDirFailureChannel}
+import kafka.server.{BrokerTopicStats, FetchHighWatermark}
 import kafka.utils.{KafkaScheduler, TestUtils}
 import org.apache.kafka.common.record.SimpleRecord
 import org.apache.kafka.common.utils.{Time, Utils}
+import org.apache.kafka.server.log.internals.LogDirFailureChannel
 import org.junit.jupiter.api.Assertions._
 import org.junit.jupiter.api.{AfterEach, BeforeEach, Test}
 
@@ -149,8 +150,8 @@ class LogConcurrencyTest {
       brokerTopicStats = brokerTopicStats,
       time = Time.SYSTEM,
       maxTransactionTimeoutMs = 5 * 60 * 1000,
-      maxProducerIdExpirationMs = 60 * 60 * 1000,
-      producerIdExpirationCheckIntervalMs = LogManager.ProducerIdExpirationCheckIntervalMs,
+      producerStateManagerConfig = new ProducerStateManagerConfig(kafka.server.Defaults.ProducerIdExpirationMs),
+      producerIdExpirationCheckIntervalMs = kafka.server.Defaults.ProducerIdExpirationCheckIntervalMs,
       logDirFailureChannel = new LogDirFailureChannel(10),
       topicId = None,
       keepPartitionMetadataFile = true

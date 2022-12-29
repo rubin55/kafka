@@ -21,11 +21,11 @@ import org.apache.kafka.streams.KeyValue
 import org.apache.kafka.streams.kstream.{
   GlobalKTable,
   JoinWindows,
+  KStream => KStreamJ,
   Printed,
   TransformerSupplier,
   ValueTransformerSupplier,
-  ValueTransformerWithKeySupplier,
-  KStream => KStreamJ
+  ValueTransformerWithKeySupplier
 }
 import org.apache.kafka.streams.processor.TopicNameExtractor
 import org.apache.kafka.streams.processor.api.{FixedKeyProcessorSupplier, ProcessorSupplier}
@@ -334,7 +334,7 @@ class KStream[K, V](val inner: KStreamJ[K, V]) {
    * @see `org.apache.kafka.streams.kstream.KStream#branch`
    * @deprecated since 2.8. Use `split` instead.
    */
-  //noinspection ScalaUnnecessaryParentheses
+  // noinspection ScalaUnnecessaryParentheses
   @deprecated("use `split()` instead", "2.8")
   def branch(predicates: ((K, V) => Boolean)*): Array[KStream[K, V]] =
     inner.branch(predicates.map(_.asPredicate): _*).map(kstream => new KStream(kstream))
@@ -404,7 +404,7 @@ class KStream[K, V](val inner: KStreamJ[K, V]) {
    * <p>
    * The created topic is considered as an internal topic and is meant to be used only by the current Kafka Streams instance.
    * Similar to auto-repartitioning, the topic will be created with infinite retention time and data will be automatically purged by Kafka Streams.
-   * The topic will be named as "${applicationId}-&lt;name&gt;-repartition", where "applicationId" is user-specified in
+   * The topic will be named as "\${applicationId}-&lt;name&gt;-repartition", where "applicationId" is user-specified in
    * `StreamsConfig` via parameter `APPLICATION_ID_CONFIG APPLICATION_ID_CONFIG`,
    * "&lt;name&gt;" is either provided via `Repartitioned#as(String)` or an internally
    * generated name, and "-repartition" is a fixed suffix.

@@ -36,8 +36,10 @@ import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.header.Header;
 import org.apache.kafka.connect.header.Headers;
+import org.apache.kafka.connect.runtime.errors.ErrorHandlingMetrics;
 import org.apache.kafka.connect.runtime.errors.RetryWithToleranceOperator;
 import org.apache.kafka.connect.runtime.errors.Stage;
+import org.apache.kafka.connect.runtime.errors.ToleranceType;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTask;
 import org.apache.kafka.connect.source.SourceTaskContext;
@@ -58,6 +60,7 @@ import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
@@ -196,6 +199,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
     List<SourceRecord> toSend;
     protected Map<String, String> taskConfig;
     protected boolean started = false;
+    private volatile boolean producerClosed = false;
 
     protected AbstractWorkerSourceTask(ConnectorTaskId id,
                                        SourceTask task,
@@ -214,13 +218,14 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                                        ConnectorOffsetBackingStore offsetStore,
                                        WorkerConfig workerConfig,
                                        ConnectMetrics connectMetrics,
+                                       ErrorHandlingMetrics errorMetrics,
                                        ClassLoader loader,
                                        Time time,
                                        RetryWithToleranceOperator retryWithToleranceOperator,
                                        StatusBackingStore statusBackingStore,
                                        Executor closeExecutor) {
 
-        super(id, statusListener, initialState, loader, connectMetrics,
+        super(id, statusListener, initialState, loader, connectMetrics, errorMetrics,
                 retryWithToleranceOperator, time, statusBackingStore);
 
         this.workerConfig = workerConfig;
@@ -233,7 +238,7 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         this.admin = admin;
         this.offsetReader = offsetReader;
         this.offsetWriter = offsetWriter;
-        this.offsetStore = offsetStore;
+        this.offsetStore = Objects.requireNonNull(offsetStore, "offset store cannot be null for source tasks");
         this.closeExecutor = closeExecutor;
         this.sourceTaskContext = sourceTaskContext;
 
@@ -311,10 +316,12 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
         Utils.closeQuietly(retryWithToleranceOperator, "retry operator");
         Utils.closeQuietly(offsetReader, "offset reader");
         Utils.closeQuietly(offsetStore::stop, "offset backing store");
+        Utils.closeQuietly(headerConverter, "header converter");
     }
 
     private void closeProducer(Duration duration) {
         if (producer != null) {
+            producerClosed = true;
             Utils.closeQuietly(() -> producer.close(duration), "source task producer");
         }
     }
@@ -397,9 +404,17 @@ public abstract class AbstractWorkerSourceTask extends WorkerTask {
                     producerRecord,
                     (recordMetadata, e) -> {
                         if (e != null) {
-                            log.debug("{} failed to send record to {}: ", AbstractWorkerSourceTask.this, topic, e);
+                            if (producerClosed) {
+                                log.trace("{} failed to send record to {}; this is expected as the producer has already been closed", AbstractWorkerSourceTask.this, topic, e);
+                            } else {
+                                log.error("{} failed to send record to {}: ", AbstractWorkerSourceTask.this, topic, e);
+                            }
                             log.trace("{} Failed record: {}", AbstractWorkerSourceTask.this, preTransformRecord);
                             producerSendFailed(false, producerRecord, preTransformRecord, e);
+                            if (retryWithToleranceOperator.getErrorToleranceType() == ToleranceType.ALL) {
+                                counter.skipRecord();
+                                submittedRecord.ifPresent(SubmittedRecords.SubmittedRecord::ack);
+                            }
                         } else {
                             counter.completeRecord();
                             log.trace("{} Wrote record successfully: topic {} partition {} offset {}",

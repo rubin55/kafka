@@ -84,7 +84,9 @@ import org.apache.kafka.metadata.LeaderRecoveryState;
 import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.Replicas;
 import org.apache.kafka.metadata.placement.ClusterDescriber;
+import org.apache.kafka.metadata.placement.PartitionAssignment;
 import org.apache.kafka.metadata.placement.PlacementSpec;
+import org.apache.kafka.metadata.placement.TopicAssignment;
 import org.apache.kafka.metadata.placement.UsableBroker;
 import org.apache.kafka.server.common.ApiMessageAndVersion;
 import org.apache.kafka.server.common.MetadataVersion;
@@ -92,7 +94,6 @@ import org.apache.kafka.server.policy.CreateTopicPolicy;
 import org.apache.kafka.timeline.SnapshotRegistry;
 import org.apache.kafka.timeline.TimelineHashMap;
 import org.apache.kafka.timeline.TimelineHashSet;
-import org.apache.kafka.timeline.TimelineInteger;
 import org.slf4j.Logger;
 
 import java.util.AbstractMap.SimpleImmutableEntry;
@@ -106,25 +107,22 @@ import java.util.List;
 import java.util.ListIterator;
 import java.util.Map.Entry;
 import java.util.Map;
-import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
-import java.util.function.Function;
+import java.util.function.IntPredicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
 import static org.apache.kafka.clients.admin.AlterConfigOp.OpType.SET;
 import static org.apache.kafka.common.config.ConfigResource.Type.TOPIC;
-import static org.apache.kafka.common.metadata.MetadataRecordType.PARTITION_RECORD;
-import static org.apache.kafka.common.metadata.MetadataRecordType.REMOVE_TOPIC_RECORD;
-import static org.apache.kafka.common.metadata.MetadataRecordType.TOPIC_RECORD;
 import static org.apache.kafka.common.protocol.Errors.FENCED_LEADER_EPOCH;
 import static org.apache.kafka.common.protocol.Errors.INELIGIBLE_REPLICA;
 import static org.apache.kafka.common.protocol.Errors.INVALID_REQUEST;
 import static org.apache.kafka.common.protocol.Errors.INVALID_UPDATE_VERSION;
 import static org.apache.kafka.common.protocol.Errors.NEW_LEADER_ELECTED;
 import static org.apache.kafka.common.protocol.Errors.NONE;
+import static org.apache.kafka.common.protocol.Errors.NOT_CONTROLLER;
 import static org.apache.kafka.common.protocol.Errors.NO_REASSIGNMENT_IN_PROGRESS;
 import static org.apache.kafka.common.protocol.Errors.OPERATION_NOT_ATTEMPTED;
 import static org.apache.kafka.common.protocol.Errors.TOPIC_AUTHORIZATION_FAILED;
@@ -150,7 +148,6 @@ public class ReplicationControlManager {
         private int maxElectionsPerImbalance = MAX_ELECTIONS_PER_IMBALANCE;
         private ConfigurationControlManager configurationControl = null;
         private ClusterControlManager clusterControl = null;
-        private ControllerMetrics controllerMetrics = null;
         private Optional<CreateTopicPolicy> createTopicPolicy = Optional.empty();
         private FeatureControlManager featureControl = null;
 
@@ -189,11 +186,6 @@ public class ReplicationControlManager {
             return this;
         }
 
-        Builder setControllerMetrics(ControllerMetrics controllerMetrics) {
-            this.controllerMetrics = controllerMetrics;
-            return this;
-        }
-
         Builder setCreateTopicPolicy(Optional<CreateTopicPolicy> createTopicPolicy) {
             this.createTopicPolicy = createTopicPolicy;
             return this;
@@ -209,8 +201,6 @@ public class ReplicationControlManager {
                 throw new IllegalStateException("Configuration control must be set before building");
             } else if (clusterControl == null) {
                 throw new IllegalStateException("Cluster controller must be set before building");
-            } else if (controllerMetrics == null) {
-                throw new IllegalStateException("Metrics must be set before building");
             }
             if (logContext == null) logContext = new LogContext();
             if (snapshotRegistry == null) snapshotRegistry = configurationControl.snapshotRegistry();
@@ -231,7 +221,6 @@ public class ReplicationControlManager {
                 maxElectionsPerImbalance,
                 configurationControl,
                 clusterControl,
-                controllerMetrics,
                 createTopicPolicy,
                 featureControl);
         }
@@ -261,6 +250,10 @@ public class ReplicationControlManager {
 
         public Uuid topicId() {
             return id;
+        }
+
+        public int numPartitions(long epoch) {
+            return parts.size(epoch);
         }
     }
 
@@ -294,11 +287,6 @@ public class ReplicationControlManager {
     private final int maxElectionsPerImbalance;
 
     /**
-     * A count of the total number of partitions in the cluster.
-     */
-    private final TimelineInteger globalPartitionCount;
-
-    /**
      * A reference to the controller's configuration control manager.
      */
     private final ConfigurationControlManager configurationControl;
@@ -307,11 +295,6 @@ public class ReplicationControlManager {
      * A reference to the controller's cluster control manager.
      */
     private final ClusterControlManager clusterControl;
-
-    /**
-     * A reference to the controller's metrics registry.
-     */
-    private final ControllerMetrics controllerMetrics;
 
     /**
      * The policy to use to validate that topic assignments are valid, if one is present.
@@ -341,7 +324,7 @@ public class ReplicationControlManager {
      * Since we reject topic creations that would collide, under normal conditions the
      * sets in this map should only have a size of 1. However, if the cluster was
      * upgraded from a version prior to KAFKA-13743, it may be possible to have more
-     * values here, since collidiing topic names will be "grandfathered in."
+     * values here, since colliding topic names will be "grandfathered in."
      */
     private final TimelineHashMap<String, TimelineHashSet<String>> topicsWithCollisionChars;
 
@@ -378,7 +361,6 @@ public class ReplicationControlManager {
         int maxElectionsPerImbalance,
         ConfigurationControlManager configurationControl,
         ClusterControlManager clusterControl,
-        ControllerMetrics controllerMetrics,
         Optional<CreateTopicPolicy> createTopicPolicy,
         FeatureControlManager featureControl
     ) {
@@ -388,11 +370,9 @@ public class ReplicationControlManager {
         this.defaultNumPartitions = defaultNumPartitions;
         this.maxElectionsPerImbalance = maxElectionsPerImbalance;
         this.configurationControl = configurationControl;
-        this.controllerMetrics = controllerMetrics;
         this.createTopicPolicy = createTopicPolicy;
         this.featureControl = featureControl;
         this.clusterControl = clusterControl;
-        this.globalPartitionCount = new TimelineInteger(snapshotRegistry);
         this.topicsByName = new TimelineHashMap<>(snapshotRegistry, 0);
         this.topicsWithCollisionChars = new TimelineHashMap<>(snapshotRegistry, 0);
         this.topics = new TimelineHashMap<>(snapshotRegistry, 0);
@@ -414,7 +394,6 @@ public class ReplicationControlManager {
         }
         topics.put(record.topicId(),
             new TopicControlInfo(record.name(), snapshotRegistry, record.topicId()));
-        controllerMetrics.setGlobalTopicsCount(topics.size());
         log.info("Created topic {} with topic ID {}.", record.name(), record.topicId());
     }
 
@@ -433,8 +412,6 @@ public class ReplicationControlManager {
             topicInfo.parts.put(record.partitionId(), newPartInfo);
             brokersToIsrs.update(record.topicId(), record.partitionId(), null,
                 newPartInfo.isr, NO_LEADER, newPartInfo.leader);
-            globalPartitionCount.increment();
-            controllerMetrics.setGlobalPartitionCount(globalPartitionCount.get());
             updateReassigningTopicsIfNeeded(record.topicId(), record.partitionId(),
                     false,  newPartInfo.isReassigning());
         } else if (!newPartInfo.equals(prevPartInfo)) {
@@ -451,9 +428,6 @@ public class ReplicationControlManager {
         } else {
             imbalancedPartitions.add(new TopicIdPartition(record.topicId(), record.partitionId()));
         }
-
-        controllerMetrics.setOfflinePartitionCount(brokersToIsrs.offlinePartitionCount());
-        controllerMetrics.setPreferredReplicaImbalanceCount(imbalancedPartitions.size());
     }
 
     private void updateReassigningTopicsIfNeeded(Uuid topicId, int partitionId,
@@ -502,9 +476,6 @@ public class ReplicationControlManager {
             imbalancedPartitions.add(new TopicIdPartition(record.topicId(), record.partitionId()));
         }
 
-        controllerMetrics.setOfflinePartitionCount(brokersToIsrs.offlinePartitionCount());
-        controllerMetrics.setPreferredReplicaImbalanceCount(imbalancedPartitions.size());
-
         if (record.removingReplicas() != null || record.addingReplicas() != null) {
             log.info("Replayed partition assignment change {} for topic {}", record, topicInfo.name);
         } else if (log.isTraceEnabled()) {
@@ -526,7 +497,7 @@ public class ReplicationControlManager {
             if (colliding != null) {
                 colliding.remove(topic.name);
                 if (colliding.isEmpty()) {
-                    topicsWithCollisionChars.remove(topic.name);
+                    topicsWithCollisionChars.remove(normalizedName);
                 }
             }
         }
@@ -545,15 +516,9 @@ public class ReplicationControlManager {
             }
 
             imbalancedPartitions.remove(new TopicIdPartition(record.topicId(), partitionId));
-
-            globalPartitionCount.decrement();
         }
         brokersToIsrs.removeTopicEntryForBroker(topic.id, NO_LEADER);
 
-        controllerMetrics.setGlobalTopicsCount(topics.size());
-        controllerMetrics.setGlobalPartitionCount(globalPartitionCount.get());
-        controllerMetrics.setOfflinePartitionCount(brokersToIsrs.offlinePartitionCount());
-        controllerMetrics.setPreferredReplicaImbalanceCount(imbalancedPartitions.size());
         log.info("Removed topic {} with ID {}.", topic.name, record.topicId());
     }
 
@@ -656,7 +621,7 @@ public class ReplicationControlManager {
                 validateManualPartitionAssignment(assignment.brokerIds(), replicationFactor);
                 replicationFactor = OptionalInt.of(assignment.brokerIds().size());
                 List<Integer> isr = assignment.brokerIds().stream().
-                    filter(clusterControl::active).collect(Collectors.toList());
+                    filter(clusterControl::isActive).collect(Collectors.toList());
                 if (isr.isEmpty()) {
                     return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,
                         "All brokers specified in the manual partition assignment for " +
@@ -665,6 +630,12 @@ public class ReplicationControlManager {
                 newParts.put(assignment.partitionIndex(), new PartitionRegistration(
                     Replicas.toArray(assignment.brokerIds()), Replicas.toArray(isr),
                     Replicas.NONE, Replicas.NONE, isr.get(0), LeaderRecoveryState.RECOVERED, 0, 0));
+            }
+            for (int i = 0; i < newParts.size(); i++) {
+                if (!newParts.containsKey(i)) {
+                    return new ApiError(Errors.INVALID_REPLICA_ASSIGNMENT,
+                            "partitions should be a consecutive 0-based integer sequence");
+                }
             }
             ApiError error = maybeCheckCreateTopicPolicy(() -> {
                 Map<Integer, List<Integer>> assignments = new HashMap<>();
@@ -686,15 +657,16 @@ public class ReplicationControlManager {
             short replicationFactor = topic.replicationFactor() == -1 ?
                 defaultReplicationFactor : topic.replicationFactor();
             try {
-                List<List<Integer>> partitions = clusterControl.replicaPlacer().place(new PlacementSpec(
+                TopicAssignment topicAssignment = clusterControl.replicaPlacer().place(new PlacementSpec(
                     0,
                     numPartitions,
                     replicationFactor
                 ), clusterDescriber);
-                for (int partitionId = 0; partitionId < partitions.size(); partitionId++) {
-                    List<Integer> replicas = partitions.get(partitionId);
+                for (int partitionId = 0; partitionId < topicAssignment.assignments().size(); partitionId++) {
+                    PartitionAssignment partitionAssignment = topicAssignment.assignments().get(partitionId);
+                    List<Integer> replicas = partitionAssignment.replicas();
                     List<Integer> isr = replicas.stream().
-                        filter(clusterControl::active).collect(Collectors.toList());
+                        filter(clusterControl::isActive).collect(Collectors.toList());
                     // If the ISR is empty, it means that all brokers are fenced or
                     // in controlled shutdown. To be consistent with the replica placer,
                     // we reject the create topic request with INVALID_REPLICATION_FACTOR.
@@ -744,7 +716,7 @@ public class ReplicationControlManager {
                     setIsSensitive(entry.isSensitive()));
             }
             result.setNumPartitions(newParts.size());
-            result.setReplicationFactor((short) newParts.get(0).replicas.length);
+            result.setReplicationFactor((short) newParts.values().iterator().next().replicas.length);
             result.setTopicConfigErrorCode(NONE.code());
         } else {
             result.setTopicConfigErrorCode(TOPIC_AUTHORIZATION_FAILED.code());
@@ -752,7 +724,7 @@ public class ReplicationControlManager {
         successes.put(topic.name(), result);
         records.add(new ApiMessageAndVersion(new TopicRecord().
             setName(topic.name()).
-            setTopicId(topicId), TOPIC_RECORD.highestSupportedVersion()));
+            setTopicId(topicId), (short) 0));
         for (Entry<Integer, PartitionRegistration> partEntry : newParts.entrySet()) {
             int partitionIndex = partEntry.getKey();
             PartitionRegistration info = partEntry.getValue();
@@ -887,7 +859,7 @@ public class ReplicationControlManager {
             throw new UnknownTopicIdException(UNKNOWN_TOPIC_ID.message());
         }
         records.add(new ApiMessageAndVersion(new RemoveTopicRecord().
-            setTopicId(id), REMOVE_TOPIC_RECORD.highestSupportedVersion()));
+            setTopicId(id), (short) 0));
     }
 
     // VisibleForTesting
@@ -956,7 +928,6 @@ public class ReplicationControlManager {
                     topic,
                     partitionId,
                     partition,
-                    clusterControl::active,
                     context.requestHeader().requestApiVersion(),
                     partitionData);
 
@@ -974,7 +945,7 @@ public class ReplicationControlManager {
                     partition,
                     topic.id,
                     partitionId,
-                    clusterControl::active,
+                    clusterControl::isActive,
                     featureControl.metadataVersion().isLeaderRecoverySupported());
                 if (configurationControl.uncleanLeaderElectionEnabledForTopic(topic.name())) {
                     builder.setElection(PartitionChangeBuilder.Election.UNCLEAN);
@@ -1048,7 +1019,6 @@ public class ReplicationControlManager {
      * @param topic current topic information store by the replication manager
      * @param partitionId partition id being altered
      * @param partition current partition registration for the partition being altered
-     * @param isEligibleReplica function telling if the replica is acceptable to join the ISR
      * @param partitionData partition data from the alter partition request
      *
      * @return Errors.NONE for valid alter partition data; otherwise the validation error
@@ -1058,7 +1028,6 @@ public class ReplicationControlManager {
         TopicControlInfo topic,
         int partitionId,
         PartitionRegistration partition,
-        Function<Integer, Boolean> isEligibleReplica,
         short requestApiVersion,
         AlterPartitionRequestData.PartitionData partitionData
     ) {
@@ -1068,7 +1037,23 @@ public class ReplicationControlManager {
 
             return UNKNOWN_TOPIC_OR_PARTITION;
         }
-        if (partitionData.leaderEpoch() != partition.leaderEpoch) {
+
+        // If the partition leader has a higher leader/partition epoch, then it is likely
+        // that this node is no longer the active controller. We return NOT_CONTROLLER in
+        // this case to give the leader an opportunity to find the new controller.
+        if (partitionData.leaderEpoch() > partition.leaderEpoch) {
+            log.debug("Rejecting AlterPartition request from node {} for {}-{} because " +
+                    "the current leader epoch is {}, which is greater than the local value {}.",
+                brokerId, topic.name, partitionId, partition.leaderEpoch, partitionData.leaderEpoch());
+            return NOT_CONTROLLER;
+        }
+        if (partitionData.partitionEpoch() > partition.partitionEpoch) {
+            log.debug("Rejecting AlterPartition request from node {} for {}-{} because " +
+                    "the current partition epoch is {}, which is greater than the local value {}.",
+                brokerId, topic.name, partitionId, partition.partitionEpoch, partitionData.partitionEpoch());
+            return NOT_CONTROLLER;
+        }
+        if (partitionData.leaderEpoch() < partition.leaderEpoch) {
             log.debug("Rejecting AlterPartition request from node {} for {}-{} because " +
                     "the current leader epoch is {}, not {}.", brokerId, topic.name,
                     partitionId, partition.leaderEpoch, partitionData.leaderEpoch());
@@ -1082,7 +1067,7 @@ public class ReplicationControlManager {
 
             return INVALID_REQUEST;
         }
-        if (partitionData.partitionEpoch() != partition.partitionEpoch) {
+        if (partitionData.partitionEpoch() < partition.partitionEpoch) {
             log.info("Rejecting AlterPartition request from node {} for {}-{} because " +
                     "the current partition epoch is {}, not {}.", brokerId,
                     topic.name, partitionId, partition.partitionEpoch,
@@ -1125,9 +1110,7 @@ public class ReplicationControlManager {
             return INVALID_REQUEST;
         }
 
-        List<Integer> ineligibleReplicas = partitionData.newIsr().stream()
-            .filter(replica -> !isEligibleReplica.apply(replica))
-            .collect(Collectors.toList());
+        List<IneligibleReplica> ineligibleReplicas = ineligibleReplicasForIsr(newIsr);
         if (!ineligibleReplicas.isEmpty()) {
             log.info("Rejecting AlterPartition request from node {} for {}-{} because " +
                     "it specified ineligible replicas {} in the new ISR {}.",
@@ -1141,6 +1124,21 @@ public class ReplicationControlManager {
         }
 
         return Errors.NONE;
+    }
+
+    private List<IneligibleReplica> ineligibleReplicasForIsr(int[] replicas) {
+        List<IneligibleReplica> ineligibleReplicas = new ArrayList<>(0);
+        for (Integer replicaId : replicas) {
+            BrokerRegistration registration = clusterControl.registration(replicaId);
+            if (registration == null) {
+                ineligibleReplicas.add(new IneligibleReplica(replicaId, "not registered"));
+            } else if (registration.inControlledShutdown()) {
+                ineligibleReplicas.add(new IneligibleReplica(replicaId, "shutting down"));
+            } else if (registration.fenced()) {
+                ineligibleReplicas.add(new IneligibleReplica(replicaId, "fenced"));
+            }
+        }
+        return ineligibleReplicas;
     }
 
     /**
@@ -1162,7 +1160,7 @@ public class ReplicationControlManager {
         if (featureControl.metadataVersion().isBrokerRegistrationChangeRecordSupported()) {
             records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().
                     setBrokerId(brokerId).setBrokerEpoch(brokerRegistration.epoch()).
-                    setFenced(BrokerRegistrationFencingChange.UNFENCE.value()),
+                    setFenced(BrokerRegistrationFencingChange.FENCE.value()),
                     (short) 0));
         } else {
             records.add(new ApiMessageAndVersion(new FenceBrokerRecord().
@@ -1205,7 +1203,7 @@ public class ReplicationControlManager {
         if (featureControl.metadataVersion().isBrokerRegistrationChangeRecordSupported()) {
             records.add(new ApiMessageAndVersion(new BrokerRegistrationChangeRecord().
                 setBrokerId(brokerId).setBrokerEpoch(brokerEpoch).
-                setFenced(BrokerRegistrationFencingChange.FENCE.value()),
+                setFenced(BrokerRegistrationFencingChange.UNFENCE.value()),
                 (short) 0));
         } else {
             records.add(new ApiMessageAndVersion(new UnfenceBrokerRecord().setId(brokerId).
@@ -1323,7 +1321,7 @@ public class ReplicationControlManager {
         PartitionChangeBuilder builder = new PartitionChangeBuilder(partition,
             topicId,
             partitionId,
-            clusterControl::active,
+            clusterControl::isActive,
             featureControl.metadataVersion().isLeaderRecoverySupported());
         builder.setElection(election);
         Optional<ApiMessageAndVersion> record = builder.build();
@@ -1339,13 +1337,13 @@ public class ReplicationControlManager {
     }
 
     ControllerResult<BrokerHeartbeatReply> processBrokerHeartbeat(
-                BrokerHeartbeatRequestData request, long lastCommittedOffset) {
+                BrokerHeartbeatRequestData request, long registerBrokerRecordOffset) {
         int brokerId = request.brokerId();
         long brokerEpoch = request.brokerEpoch();
         clusterControl.checkBrokerEpoch(brokerId, brokerEpoch);
         BrokerHeartbeatManager heartbeatManager = clusterControl.heartbeatManager();
         BrokerControlStates states = heartbeatManager.calculateNextBrokerState(brokerId,
-            request, lastCommittedOffset, () -> brokersToIsrs.hasLeaderships(brokerId));
+            request, registerBrokerRecordOffset, () -> brokersToIsrs.hasLeaderships(brokerId));
         List<ApiMessageAndVersion> records = new ArrayList<>();
         if (states.current() != states.next()) {
             switch (states.next()) {
@@ -1366,7 +1364,7 @@ public class ReplicationControlManager {
         heartbeatManager.touch(brokerId,
             states.next().fenced(),
             request.currentMetadataOffset());
-        boolean isCaughtUp = request.currentMetadataOffset() >= lastCommittedOffset;
+        boolean isCaughtUp = request.currentMetadataOffset() >= registerBrokerRecordOffset;
         BrokerHeartbeatReply reply = new BrokerHeartbeatReply(isCaughtUp,
                 states.next().fenced(),
                 states.next().inControlledShutdown(),
@@ -1407,7 +1405,7 @@ public class ReplicationControlManager {
      * Attempt to elect a preferred leader for all topic partitions which have a leader that is not the preferred replica.
      *
      * The response() method in the return object is true if this method returned without electing all possible preferred replicas.
-     * The quorum controlller should reschedule this operation immediately if it is true.
+     * The quorum controller should reschedule this operation immediately if it is true.
      *
      * @return All of the election records and if there may be more available preferred replicas to elect as leader
      */
@@ -1438,7 +1436,7 @@ public class ReplicationControlManager {
                 partition,
                 topicPartition.topicId(),
                 topicPartition.partitionId(),
-                clusterControl::active,
+                clusterControl::isActive,
                 featureControl.metadataVersion().isLeaderRecoverySupported()
             );
             builder.setElection(PartitionChangeBuilder.Election.PREFERRED);
@@ -1510,18 +1508,18 @@ public class ReplicationControlManager {
         short replicationFactor = (short) partitionInfo.replicas.length;
         int startPartitionId = topicInfo.parts.size();
 
-        List<List<Integer>> placements;
+        List<PartitionAssignment> partitionAssignments;
         List<List<Integer>> isrs;
         if (topic.assignments() != null) {
-            placements = new ArrayList<>();
+            partitionAssignments = new ArrayList<>();
             isrs = new ArrayList<>();
             for (int i = 0; i < topic.assignments().size(); i++) {
                 CreatePartitionsAssignment assignment = topic.assignments().get(i);
                 validateManualPartitionAssignment(assignment.brokerIds(),
                     OptionalInt.of(replicationFactor));
-                placements.add(assignment.brokerIds());
+                partitionAssignments.add(new PartitionAssignment(assignment.brokerIds()));
                 List<Integer> isr = assignment.brokerIds().stream().
-                    filter(clusterControl::active).collect(Collectors.toList());
+                    filter(clusterControl::isActive).collect(Collectors.toList());
                 if (isr.isEmpty()) {
                     throw new InvalidReplicaAssignmentException(
                         "All brokers specified in the manual partition assignment for " +
@@ -1530,18 +1528,18 @@ public class ReplicationControlManager {
                 isrs.add(isr);
             }
         } else {
-            placements = clusterControl.replicaPlacer().place(new PlacementSpec(
-                startPartitionId,
-                additional,
-                replicationFactor
-            ), clusterDescriber);
-            isrs = placements;
+            partitionAssignments = clusterControl.replicaPlacer().place(
+                new PlacementSpec(startPartitionId, additional, replicationFactor),
+                clusterDescriber
+            ).assignments();
+            isrs = partitionAssignments.stream().map(PartitionAssignment::replicas).collect(Collectors.toList());
         }
         int partitionId = startPartitionId;
-        for (int i = 0; i < placements.size(); i++) {
-            List<Integer> replicas = placements.get(i);
+        for (int i = 0; i < partitionAssignments.size(); i++) {
+            PartitionAssignment partitionAssignment = partitionAssignments.get(i);
+            List<Integer> replicas = partitionAssignment.replicas();
             List<Integer> isr = isrs.get(i).stream().
-                filter(clusterControl::active).collect(Collectors.toList());
+                filter(clusterControl::isActive).collect(Collectors.toList());
             // If the ISR is empty, it means that all brokers are fenced or
             // in controlled shutdown. To be consistent with the replica placer,
             // we reject the create topic request with INVALID_REPLICATION_FACTOR.
@@ -1560,7 +1558,7 @@ public class ReplicationControlManager {
                 setAddingReplicas(Collections.emptyList()).
                 setLeader(isr.get(0)).
                 setLeaderEpoch(0).
-                setPartitionEpoch(0), PARTITION_RECORD.highestSupportedVersion()));
+                setPartitionEpoch(0), (short) 0));
             partitionId++;
         }
     }
@@ -1627,8 +1625,8 @@ public class ReplicationControlManager {
         // from the target ISR, but we need to exclude it here too, to handle the case
         // where there is an unclean leader election which chooses a leader from outside
         // the ISR.
-        Function<Integer, Boolean> isAcceptableLeader =
-            r -> (r != brokerToRemove) && (r == brokerToAdd || clusterControl.active(r));
+        IntPredicate isAcceptableLeader =
+            r -> (r != brokerToRemove) && (r == brokerToAdd || clusterControl.isActive(r));
 
         while (iterator.hasNext()) {
             TopicIdPartition topicIdPart = iterator.next();
@@ -1755,7 +1753,7 @@ public class ReplicationControlManager {
         PartitionChangeBuilder builder = new PartitionChangeBuilder(part,
             tp.topicId(),
             tp.partitionId(),
-            clusterControl::active,
+            clusterControl::isActive,
             featureControl.metadataVersion().isLeaderRecoverySupported());
         if (configurationControl.uncleanLeaderElectionEnabledForTopic(topicName)) {
             builder.setElection(PartitionChangeBuilder.Election.UNCLEAN);
@@ -1807,7 +1805,7 @@ public class ReplicationControlManager {
         PartitionChangeBuilder builder = new PartitionChangeBuilder(part,
             tp.topicId(),
             tp.partitionId(),
-            clusterControl::active,
+            clusterControl::isActive,
             featureControl.metadataVersion().isLeaderRecoverySupported());
         if (!reassignment.merged().equals(currentReplicas)) {
             builder.setTargetReplicas(reassignment.merged());
@@ -1874,36 +1872,18 @@ public class ReplicationControlManager {
             setReplicas(Replicas.toList(partition.replicas)));
     }
 
-    class ReplicationControlIterator implements Iterator<List<ApiMessageAndVersion>> {
-        private final long epoch;
-        private final Iterator<TopicControlInfo> iterator;
+    private static final class IneligibleReplica {
+        private final int replicaId;
+        private final String reason;
 
-        ReplicationControlIterator(long epoch) {
-            this.epoch = epoch;
-            this.iterator = topics.values(epoch).iterator();
+        private IneligibleReplica(int replicaId, String reason) {
+            this.replicaId = replicaId;
+            this.reason = reason;
         }
 
         @Override
-        public boolean hasNext() {
-            return iterator.hasNext();
+        public String toString() {
+            return replicaId + " (" + reason + ")";
         }
-
-        @Override
-        public List<ApiMessageAndVersion> next() {
-            if (!hasNext()) throw new NoSuchElementException();
-            TopicControlInfo topic = iterator.next();
-            List<ApiMessageAndVersion> records = new ArrayList<>();
-            records.add(new ApiMessageAndVersion(new TopicRecord().
-                setName(topic.name).
-                setTopicId(topic.id), TOPIC_RECORD.highestSupportedVersion()));
-            for (Entry<Integer, PartitionRegistration> entry : topic.parts.entrySet(epoch)) {
-                records.add(entry.getValue().toRecord(topic.id, entry.getKey()));
-            }
-            return records;
-        }
-    }
-
-    ReplicationControlIterator iterator(long epoch) {
-        return new ReplicationControlIterator(epoch);
     }
 }

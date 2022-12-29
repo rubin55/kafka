@@ -45,6 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
@@ -108,7 +109,7 @@ public class ZkClusterInvocationContext implements TestTemplateInvocationContext
                     @Override
                     public Properties serverConfig() {
                         Properties props = clusterConfig.serverProperties();
-                        props.put(KafkaConfig.InterBrokerProtocolVersionProp(), metadataVersion().version());
+                        props.put(KafkaConfig.InterBrokerProtocolVersionProp(), clusterConfig.metadataVersion().version());
                         return props;
                     }
 
@@ -236,7 +237,7 @@ public class ZkClusterInvocationContext implements TestTemplateInvocationContext
                 .filter(broker -> broker.kafkaController().isActive())
                 .map(KafkaServer::socketServer)
                 .findFirst()
-                .orElseThrow(() -> new RuntimeException("No broker SocketServers found"));
+                .orElseThrow(() -> new RuntimeException("No controller SocketServers found"));
         }
 
         @Override
@@ -248,6 +249,12 @@ public class ZkClusterInvocationContext implements TestTemplateInvocationContext
         }
 
         @Override
+        public String clusterId() {
+            return servers().findFirst().map(KafkaServer::clusterId).orElseThrow(
+                () -> new RuntimeException("No broker instances found"));
+        }
+
+        @Override
         public ClusterType clusterType() {
             return ClusterType.ZK;
         }
@@ -255,6 +262,18 @@ public class ZkClusterInvocationContext implements TestTemplateInvocationContext
         @Override
         public ClusterConfig config() {
             return config;
+        }
+
+        @Override
+        public Set<Integer> controllerIds() {
+            return brokerIds();
+        }
+
+        @Override
+        public Set<Integer> brokerIds() {
+            return servers()
+                .map(brokerServer -> brokerServer.config().nodeId())
+                .collect(Collectors.toSet());
         }
 
         @Override

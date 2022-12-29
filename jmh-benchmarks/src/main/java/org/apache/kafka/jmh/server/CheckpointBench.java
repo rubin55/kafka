@@ -24,7 +24,7 @@ import kafka.server.AlterPartitionManager;
 import kafka.server.BrokerFeatures;
 import kafka.server.BrokerTopicStats;
 import kafka.server.KafkaConfig;
-import kafka.server.LogDirFailureChannel;
+import org.apache.kafka.server.log.internals.LogDirFailureChannel;
 import kafka.server.MetadataCache;
 import kafka.server.QuotaFactory;
 import kafka.server.ReplicaManager;
@@ -99,7 +99,7 @@ public class CheckpointBench {
         this.brokerProperties = KafkaConfig.fromProps(TestUtils.createBrokerConfig(
                 0, TestUtils.MockZkConnect(), true, true, 9092, Option.empty(), Option.empty(),
                 Option.empty(), true, false, 0, false, 0, false, 0, Option.empty(), 1, true, 1,
-                (short) 1));
+                (short) 1, false));
         this.metrics = new Metrics();
         this.time = new MockTime();
         this.failureChannel = new LogDirFailureChannel(brokerProperties.logDirs().size());
@@ -108,11 +108,13 @@ public class CheckpointBench {
         this.logManager = TestUtils.createLogManager(JavaConverters.asScalaBuffer(files),
                 LogConfig.apply(), new MockConfigRepository(), CleanerConfig.apply(1, 4 * 1024 * 1024L, 0.9d,
                         1024 * 1024, 32 * 1024 * 1024,
-                        Double.MAX_VALUE, 15 * 1000, true, "MD5"), time, MetadataVersion.latest());
+                        Double.MAX_VALUE, 15 * 1000, true, "MD5"), time, MetadataVersion.latest(), 4);
         scheduler.startup();
         final BrokerTopicStats brokerTopicStats = new BrokerTopicStats();
         final MetadataCache metadataCache =
-                MetadataCache.zkMetadataCache(this.brokerProperties.brokerId(), this.brokerProperties.interBrokerProtocolVersion(), BrokerFeatures.createEmpty());
+                MetadataCache.zkMetadataCache(this.brokerProperties.brokerId(),
+                    this.brokerProperties.interBrokerProtocolVersion(),
+                    BrokerFeatures.createEmpty(), null);
         this.quotaManagers =
                 QuotaFactory.instantiate(this.brokerProperties,
                         this.metrics,

@@ -37,7 +37,7 @@ import org.junit.jupiter.api.extension.ExtendWith
 
 import scala.jdk.CollectionConverters._
 
-@ClusterTestDefaults(clusterType = Type.BOTH)
+@ClusterTestDefaults(clusterType = Type.ALL)
 @ExtendWith(value = Array(classOf[ClusterTestExtensions]))
 @Tag("integration")
 class ClientQuotasRequestTest(cluster: ClusterInstance) {
@@ -588,7 +588,7 @@ class ClientQuotasRequestTest(cluster: ClusterInstance) {
   private def alterClientQuotas(request: Map[ClientQuotaEntity, Map[String, Option[Double]]], validateOnly: Boolean) = {
     val entries = request.map { case (entity, alter) =>
       val ops = alter.map { case (key, value) =>
-        new ClientQuotaAlteration.Op(key, value.map(Double.box).getOrElse(null))
+        new ClientQuotaAlteration.Op(key, value.map(Double.box).orNull)
       }.asJavaCollection
       new ClientQuotaAlteration(entity, ops)
     }
